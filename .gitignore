@@ -1,0 +1,19 @@
+# 打包产物
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 生成的图标（build.ps1 会自动重建）
+aifuel.ico
+
+# 运行时状态实际在 %LOCALAPPDATA%\aifuel\，这些是早期版本留在项目里的残留
+.cache.json
+cache.json
+config*.json
