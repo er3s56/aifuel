@@ -15,11 +15,13 @@ import sources
 
 CONFIG = os.path.join(sources.data_dir(), "config_tk.json")
 
-W, H = 238, 80
-ROW_Y = (13, 31, 51, 69)          # 四行基线：CL-5h, CL-wk, GPT-5h, GPT-wk
-X_TAG, X_LABEL, X_PCT = 9, 34, 92
-BAR_X0, BAR_X1, BAR_H = 99, 196, 5
-X_RESET = W - 7
+# 绝对时间（"周二 01:59"）比倒计时占列宽，窗口相应加宽。
+W = 292
+ROW_H, TOP = 20, 8
+X_TAG, X_LABEL, X_PCT = 9, 42, 146
+BAR_X0, BAR_X1, BAR_H = 154, 220, 5
+X_RESET = W - 9
+MIN_ROWS = 4                      # 高度基准，行数少时也不至于窄成一条
 # 额度百分比变化很慢，而 /api/oauth/usage 有速率限制 —— 60 秒轮询纯属自伤。
 REFRESH_SEC = 300
 
@@ -51,9 +53,10 @@ class QuotaWidget:
 
         x = self.cfg.get("x", self.root.winfo_screenwidth() - W - 24)
         y = self.cfg.get("y", 48)
-        self.root.geometry("%dx%d+%d+%d" % (W, H, x, y))
+        h0 = TOP * 2 + MIN_ROWS * ROW_H
+        self.root.geometry("%dx%d+%d+%d" % (W, h0, x, y))
 
-        self.canvas = tk.Canvas(self.root, width=W, height=H, bg=display.BG,
+        self.canvas = tk.Canvas(self.root, width=W, height=h0, bg=display.BG,
                                 highlightthickness=1, highlightbackground="#2a2e35")
         self.canvas.pack()
 
@@ -123,45 +126,58 @@ class QuotaWidget:
 
     def draw(self) -> None:
         c = self.canvas
+        rows = max(MIN_ROWS, len(self.readings))
+        h = TOP * 2 + rows * ROW_H
+        if int(c["height"]) != h:                    # 行数变了就重排窗口
+            c.config(height=h)
+            self.root.geometry("%dx%d+%d+%d" % (W, h, self.root.winfo_x(), self.root.winfo_y()))
+
         c.delete("all")
         if self.loading:
-            c.create_text(W // 2, H // 2, text="读取中…", fill=display.FG_DIM,
+            c.create_text(W // 2, h // 2, text="读取中…", fill=display.FG_DIM,
                           font=("Segoe UI", 9))
             return
 
-        order = [("claude", "5h"), ("claude", "week"),
-                 ("chatgpt", "5h"), ("chatgpt", "week")]
-        index = {(r.provider, r.label): r for r in self.readings}
-
-        for i, key in enumerate(order):
-            y = ROW_Y[i]
-            r = index.get(key)
-            if r is None:
-                continue
+        cjk = ("Microsoft YaHei", 7)                 # 绝对时间里有"周二"这样的汉字
+        prev_provider = None
+        for i, r in enumerate(self.readings):
+            y = TOP + i * ROW_H + ROW_H // 2
             res = display.resolve(r)
             # Canvas 没有 per-item alpha，只能手工混色来表达 dim
             color = display.dimmed(res.color) if res.dim else res.color
 
-            if i % 2 == 0:                                  # 每个服务只在首行标名字
-                c.create_text(X_TAG, y, text=display.NAME[key[0]], anchor="w",
-                              fill=display.BRAND[key[0]], font=("Segoe UI Semibold", 8))
-            c.create_text(X_LABEL, y, text="5h" if key[1] == "5h" else "wk",
-                          anchor="w", fill=display.FG_DIM, font=("Consolas", 8))
+            if r.provider != prev_provider:          # 每个服务只在首行标名字
+                c.create_text(X_TAG, y, anchor="w",
+                              text=display.NAME.get(r.provider, r.provider[:3].upper()),
+                              fill=display.BRAND.get(r.provider, display.FG),
+                              font=("Segoe UI Semibold", 8))
+                prev_provider = r.provider
 
-            pct_txt = "--" if res.percent is None else "%d%%" % round(res.percent)
-            c.create_text(X_PCT, y, text=pct_txt + res.note, anchor="e",
+            has_cjk = any(ord(ch) > 127 for ch in r.label)
+            c.create_text(X_LABEL, y, text=r.label, anchor="w", fill=display.FG_DIM,
+                          font=cjk if has_cjk else ("Consolas", 8))
+
+            if r.text is not None:                   # 非百分比的值（余额等）
+                val = r.text
+            else:
+                val = "--" if res.percent is None else "%d%%" % round(res.percent)
+            c.create_text(X_PCT, y, text=val + res.note, anchor="e",
                           fill=color, font=("Consolas", 9, "bold"))
 
-            c.create_rectangle(BAR_X0, y - BAR_H // 2, BAR_X1, y + BAR_H // 2 + 1,
-                               fill=display.TRACK, width=0)
-            if res.percent is not None:
-                w = (BAR_X1 - BAR_X0) * min(100.0, max(0.0, res.percent)) / 100.0
-                if w >= 1:
-                    c.create_rectangle(BAR_X0, y - BAR_H // 2, BAR_X0 + w,
-                                       y + BAR_H // 2 + 1, fill=color, width=0)
+            if r.text is None:                       # 只有百分比类的行才画进度条
+                c.create_rectangle(BAR_X0, y - BAR_H // 2, BAR_X1, y + BAR_H // 2 + 1,
+                                   fill=display.TRACK, width=0)
+                if res.percent is not None:
+                    w = (BAR_X1 - BAR_X0) * min(100.0, max(0.0, res.percent)) / 100.0
+                    if w >= 1:
+                        c.create_rectangle(BAR_X0, y - BAR_H // 2, BAR_X0 + w,
+                                           y + BAR_H // 2 + 1, fill=color, width=0)
 
-            c.create_text(X_RESET, y, text=display.fmt_countdown(r.reset_in()),
-                          anchor="e", fill=display.FG_DIM, font=("Consolas", 8))
+            reset_txt = display.fmt_reset(r.resets_at)
+            if reset_txt:
+                c.create_text(X_RESET, y, text=reset_txt, anchor="e", fill=display.FG_DIM,
+                              font=cjk if any(ord(ch) > 127 for ch in reset_txt)
+                              else ("Consolas", 8))
 
     def run(self) -> None:
         self.root.mainloop()

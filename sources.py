@@ -68,6 +68,7 @@ class Reading:
     severity: str = "normal"            # normal | warning | critical
     stale: bool = False                 # True = 缓存值，非实时
     error: Optional[str] = None
+    text: Optional[str] = None          # 非百分比的值（如余额），有则替代百分比显示
 
     def reset_in(self) -> Optional[float]:
         """距离重置还有多少秒；None 表示未知。"""
@@ -170,36 +171,64 @@ def read_claude(timeout: float = 12.0) -> "list[Reading]":
 
     _backoff_step = 0.0            # 成功一次就把退避清零
     _backoff_until = 0.0
-    readings = []
 
-    # 优先用 limits[]：带 severity，是服务端自己的判断
-    by_kind = {}
-    for item in payload.get("limits") or []:
-        if isinstance(item, dict) and item.get("kind"):
-            by_kind[item["kind"]] = item
-
-    def take(kind, top_key, label):
-        item = by_kind.get(kind)
-        if item and item.get("percent") is not None:
-            readings.append(Reading(
-                "claude", label, float(item["percent"]),
-                _iso_to_epoch(item.get("resets_at")),
-                item.get("severity") or "normal",
-            ))
-            return
-        blk = payload.get(top_key)          # 回退到顶层字段
-        if isinstance(blk, dict) and blk.get("utilization") is not None:
-            readings.append(Reading(
-                "claude", label, float(blk["utilization"]),
-                _iso_to_epoch(blk.get("resets_at")),
-            ))
-
-    take("session", "five_hour", "5h")
-    take("weekly_all", "seven_day", "week")
-
+    readings = _parse_claude_limits(payload)
     if readings:
         _save_cache("claude", readings)
     return readings or [Reading("claude", "5h", None, error="返回里没有额度字段")]
+
+
+# 已知 kind 的短标签。不在表里的 kind 不会被丢掉，会用 kind 名本身当标签 ——
+# 服务端随时可能加新的限制类型（Opus/Sonnet 分项之类），硬编码白名单就会漏。
+_CLAUDE_LABELS = {
+    "session": "5h",
+    "weekly_all": "wk",
+    "weekly_scoped": "wk",      # 后面会被 scope 里的模型名覆盖
+}
+
+
+def _claude_label(item: dict) -> str:
+    scope = item.get("scope") or {}
+    model = (scope.get("model") or {}).get("display_name")
+    if model:
+        return str(model)[:8]               # 如 "Fable"，列宽有限
+    surface = (scope.get("surface") or {}).get("display_name") if scope else None
+    if surface:
+        return str(surface)[:8]
+    kind = item.get("kind") or "?"
+    return _CLAUDE_LABELS.get(kind, kind.replace("_", " ")[:8])
+
+
+def _parse_claude_limits(payload: dict) -> "list[Reading]":
+    """把返回里的每一条限额都变成一行，而不是只挑认识的那两条。"""
+    out = []
+    seen = set()
+    for item in payload.get("limits") or []:
+        if not isinstance(item, dict) or item.get("percent") is None:
+            continue
+        label = _claude_label(item)
+        key = (label, item.get("kind"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Reading(
+            "claude", label, float(item["percent"]),
+            _iso_to_epoch(item.get("resets_at")),
+            item.get("severity") or "normal",
+        ))
+    if out:
+        return out
+
+    # limits[] 缺失时回退到顶层字段。顶层还有一堆未发布功能的占位键
+    # （nimbus_quill 之类，utilization 恒为 0），只取这两个明确的。
+    for top_key, label in (("five_hour", "5h"), ("seven_day", "wk")):
+        blk = payload.get(top_key)
+        if isinstance(blk, dict) and blk.get("utilization") is not None:
+            out.append(Reading(
+                "claude", label, float(blk["utilization"]),
+                _iso_to_epoch(blk.get("resets_at")),
+            ))
+    return out
 
 
 # ---------------------------------------------------------------- Codex
@@ -211,6 +240,38 @@ def _tail(path: str, nbytes: int = 512 * 1024) -> str:
         size = f.tell()
         f.seek(max(0, size - nbytes))
         return f.read().decode("utf-8", "replace")
+
+
+# primary/secondary 是目前见过的全部窗口键，但同样不做白名单：
+# 任何带 used_percent 的字典都当成一条限额显示。
+_CODEX_LABELS = {"primary": "5h", "secondary": "wk"}
+
+
+def _parse_codex_limits(rl: dict) -> "list[Reading]":
+    out = []
+    for key, blk in rl.items():
+        if not isinstance(blk, dict):
+            continue
+        if blk.get("used_percent") is None:
+            continue
+        out.append(Reading(
+            "chatgpt", _CODEX_LABELS.get(key, key.replace("_", " ")[:8]),
+            float(blk["used_percent"]), blk.get("resets_at"),
+        ))
+    # 排序：认识的窗口在前，其余按名字排，保证行序稳定不会每次刷新乱跳
+    order = {"5h": 0, "wk": 1}
+    out.sort(key=lambda r: (order.get(r.label, 2), r.label))
+
+    # 付费余量：只有真的启用了才占一行，否则一直显示 "余额 0" 是噪音。
+    # 它是绝对值不是百分比，走 text 字段，前端不给它画进度条。
+    credits = rl.get("credits")
+    if isinstance(credits, dict) and credits.get("has_credits"):
+        if credits.get("unlimited"):
+            out.append(Reading("chatgpt", "余额", None, text="∞"))
+        else:
+            bal = credits.get("balance")
+            out.append(Reading("chatgpt", "余额", None, text=str(bal) if bal is not None else "?"))
+    return out
 
 
 def _newest_sessions(limit: int = 8) -> "list[str]":
@@ -244,14 +305,7 @@ def read_codex() -> "list[Reading]":
             rl = (rec.get("payload") or {}).get("rate_limits")
             if not isinstance(rl, dict):
                 continue
-            readings = []
-            for key, label in (("primary", "5h"), ("secondary", "week")):
-                blk = rl.get(key)
-                if isinstance(blk, dict) and blk.get("used_percent") is not None:
-                    readings.append(Reading(
-                        "chatgpt", label, float(blk["used_percent"]),
-                        blk.get("resets_at"),
-                    ))
+            readings = _parse_codex_limits(rl)
             if readings:
                 _save_cache("chatgpt", readings)
                 return readings

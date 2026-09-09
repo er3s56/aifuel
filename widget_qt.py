@@ -2,7 +2,7 @@
 """置顶额度悬浮窗 —— PySide6 版（圆角、半透明、抗锯齿）。
 
 和 tk 版共用 sources.py / display.py，行为一致，只是画得好看些。
-左键拖动，右键菜单，鼠标移上去自动变透明以免挡住底下的东西。
+左键拖动，右键菜单。行数随服务端返回的限额条数自适应。
 """
 from __future__ import annotations
 
@@ -19,10 +19,13 @@ import sources
 
 CONFIG = os.path.join(sources.data_dir(), "config_qt.json")
 
-W, H = 258, 104
+# 绝对时间（"周二 01:59"）比倒计时占列宽，窗口相应加宽。
+W = 300
 PAD_X, ROW_H, TOP = 11, 22, 8
-X_LABEL, X_PCT = 40, 100
-BAR_X0, BAR_X1, BAR_H = 108, 208, 6
+X_LABEL, X_PCT = 42, 150
+BAR_X0, BAR_X1, BAR_H = 158, 226, 6
+X_RESET_END = W - PAD_X
+MIN_ROWS = 4                    # 高度基准，实际行数少于它时也不至于窄成一条
 # 额度百分比变化很慢，而 /api/oauth/usage 有速率限制 —— 60 秒轮询纯属自伤。
 REFRESH_SEC = 300
 RADIUS = 10
@@ -52,12 +55,10 @@ class QuotaWidget(QWidget):
         self.readings: list = []
         self.loading = True
         self._drag_pos = None
-        self._hovering = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setMouseTracking(True)
-        self.resize(W, H)
+        self.resize(W, TOP * 2 + MIN_ROWS * ROW_H)
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(self.cfg.get("x", screen.right() - W - 24), self.cfg.get("y", 48))
@@ -103,6 +104,12 @@ class QuotaWidget(QWidget):
         if data:
             self.readings = data
         self.loading = False
+        # 行数随服务端返回的限额条数变化（多一条 Fable、多一条余额都可能），
+        # 所以每轮取完数都要按实际行数重算窗口高度
+        rows = max(MIN_ROWS, len(self.readings))
+        want_h = TOP * 2 + rows * ROW_H
+        if self.height() != want_h:
+            self.resize(W, want_h)
         self.update()
         # 退避中就掐着退避到期的点重试，别白等一整个刷新周期
         wait = sources.backoff_remaining()
@@ -127,14 +134,6 @@ class QuotaWidget(QWidget):
     def mouseDoubleClickEvent(self, e) -> None:
         self.refresh()
 
-    def enterEvent(self, e) -> None:
-        self._hovering = True
-        self.setWindowOpacity(0.35)                  # 移开视线障碍
-
-    def leaveEvent(self, e) -> None:
-        self._hovering = False
-        self.setWindowOpacity(self.cfg.get("alpha", 0.94))
-
     def contextMenuEvent(self, e) -> None:
         m = QMenu(self)
         act = QAction("立即刷新", self)
@@ -154,8 +153,7 @@ class QuotaWidget(QWidget):
     def _set_alpha(self, v: float) -> None:
         self.cfg["alpha"] = v
         self._save_cfg()
-        if not self._hovering:
-            self.setWindowOpacity(v)
+        self.setWindowOpacity(v)
 
     # ------------------------------------------------ 绘制
 
@@ -167,13 +165,14 @@ class QuotaWidget(QWidget):
         # resize() 拿到的物理像素和绘制用的逻辑坐标不是一回事，
         # 硬编码常量会让最后一行溢出窗口被裁掉。
         w, h = float(self.width()), float(self.height())
-        pad = w * (PAD_X / W)
-        x_label = w * (X_LABEL / W)
-        x_pct = w * (X_PCT / W)
-        bar0, bar1 = w * (BAR_X0 / W), w * (BAR_X1 / W)
-        bar_h = max(4.0, h * (BAR_H / H))
-        top = h * (TOP / H)
-        row_h = (h - 2 * top) / 4.0
+        sx = w / W
+        pad, x_label, x_pct = PAD_X * sx, X_LABEL * sx, X_PCT * sx
+        bar0, bar1 = BAR_X0 * sx, BAR_X1 * sx
+        x_reset_end = X_RESET_END * sx
+        rows = max(MIN_ROWS, len(self.readings))
+        top = h * TOP / (TOP * 2 + rows * ROW_H)
+        row_h = (h - 2 * top) / rows
+        bar_h = max(4.0, BAR_H * sx)
 
         path = QPainterPath()
         path.addRoundedRect(QRectF(0, 0, w, h), RADIUS, RADIUS)
@@ -187,55 +186,61 @@ class QuotaWidget(QWidget):
             p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter, "读取中…")
             return
 
-        order = [("claude", "5h"), ("claude", "week"),
-                 ("chatgpt", "5h"), ("chatgpt", "week")]
-        index = {(r.provider, r.label): r for r in self.readings}
-
         mono_b = QFont("Consolas", 9, QFont.Bold)
         brand_f = QFont("Segoe UI Semibold", 8)
         small = QFont("Consolas", 8)
+        small_cjk = QFont("Microsoft YaHei", 7)     # 绝对时间里有"周二"这样的汉字
 
-        for i, key in enumerate(order):
-            r = index.get(key)
-            if r is None:
-                continue
+        prev_provider = None
+        for i, r in enumerate(self.readings):
             res = display.resolve(r)
             y = top + i * row_h
             cy = y + row_h / 2
 
-            if i % 2 == 0:
-                p.setPen(_qc(display.BRAND[key[0]]))
+            # 品牌名只在该服务的第一行标一次
+            if r.provider != prev_provider:
+                p.setPen(_qc(display.BRAND.get(r.provider, display.FG)))
                 p.setFont(brand_f)
                 p.drawText(QRectF(pad, y, x_label - pad, row_h),
-                           Qt.AlignVCenter | Qt.AlignLeft, display.NAME[key[0]])
+                           Qt.AlignVCenter | Qt.AlignLeft,
+                           display.NAME.get(r.provider, r.provider[:3].upper()))
+                prev_provider = r.provider
 
             p.setPen(_qc(display.FG_DIM))
-            p.setFont(small)
-            p.drawText(QRectF(x_label, y, w * 0.12, row_h), Qt.AlignVCenter | Qt.AlignLeft,
-                       "5h" if key[1] == "5h" else "wk")
+            p.setFont(small_cjk if any(ord(c) > 127 for c in r.label) else small)
+            p.drawText(QRectF(x_label, y, (x_pct - x_label) * 0.55, row_h),
+                       Qt.AlignVCenter | Qt.AlignLeft, r.label)
 
             p.setPen(_qc(res.color, 150 if res.dim else 255))
             p.setFont(mono_b)
-            pct_txt = ("--" if res.percent is None else "%d%%" % round(res.percent)) + res.note
-            p.drawText(QRectF(x_label, y, x_pct - x_label, row_h),
-                       Qt.AlignVCenter | Qt.AlignRight, pct_txt)
+            if r.text is not None:                  # 非百分比的值（余额等）
+                val = r.text
+            else:
+                val = "--" if res.percent is None else "%d%%" % round(res.percent)
+            p.drawText(QRectF(x_label + (x_pct - x_label) * 0.5, y,
+                              (x_pct - x_label) * 0.5, row_h),
+                       Qt.AlignVCenter | Qt.AlignRight, val + res.note)
 
-            track = QPainterPath()
-            track.addRoundedRect(QRectF(bar0, cy - bar_h / 2, bar1 - bar0, bar_h),
-                                 bar_h / 2, bar_h / 2)
-            p.fillPath(track, _qc(display.TRACK))
-            if res.percent is not None:
-                fw = (bar1 - bar0) * min(100.0, max(0.0, res.percent)) / 100.0
-                if fw >= 2:
-                    fill = QPainterPath()
-                    fill.addRoundedRect(QRectF(bar0, cy - bar_h / 2, fw, bar_h),
-                                        bar_h / 2, bar_h / 2)
-                    p.fillPath(fill, _qc(res.color, 150 if res.dim else 255))
+            # 只有百分比类的行才画进度条
+            if r.text is None:
+                track = QPainterPath()
+                track.addRoundedRect(QRectF(bar0, cy - bar_h / 2, bar1 - bar0, bar_h),
+                                     bar_h / 2, bar_h / 2)
+                p.fillPath(track, _qc(display.TRACK))
+                if res.percent is not None:
+                    fw = (bar1 - bar0) * min(100.0, max(0.0, res.percent)) / 100.0
+                    if fw >= 2:
+                        fill = QPainterPath()
+                        fill.addRoundedRect(QRectF(bar0, cy - bar_h / 2, fw, bar_h),
+                                            bar_h / 2, bar_h / 2)
+                        p.fillPath(fill, _qc(res.color, 150 if res.dim else 255))
 
-            p.setPen(_qc(display.FG_DIM))
-            p.setFont(small)
-            p.drawText(QRectF(bar1, y, w - pad - bar1, row_h),
-                       Qt.AlignVCenter | Qt.AlignRight, display.fmt_countdown(r.reset_in()))
+            reset_txt = display.fmt_reset(r.resets_at)
+            if reset_txt:
+                p.setPen(_qc(display.FG_DIM))
+                p.setFont(small_cjk if any(ord(c) > 127 for c in reset_txt) else small)
+                p.drawText(QRectF(bar1, y, x_reset_end - bar1, row_h),
+                           Qt.AlignVCenter | Qt.AlignRight, reset_txt)
 
 
 def main() -> None:
