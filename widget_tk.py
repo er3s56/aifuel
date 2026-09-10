@@ -19,7 +19,8 @@ CONFIG = os.path.join(sources.data_dir(), "config_tk.json")
 W = 292
 ROW_H, TOP = 20, 8
 X_TAG, X_LABEL, X_PCT = 9, 42, 146
-BAR_X0, BAR_X1, BAR_H = 154, 220, 5
+# 进度条右边界要给 "09-15 01:59" 留够宽度。条是装饰、时间是信息，先牺牲条。
+BAR_X0, BAR_X1, BAR_H = 154, 200, 5
 X_RESET = W - 9
 MIN_ROWS = 4                      # 高度基准，行数少时也不至于窄成一条
 # 额度百分比变化很慢，而 /api/oauth/usage 有速率限制 —— 60 秒轮询纯属自伤。

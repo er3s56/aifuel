@@ -242,25 +242,42 @@ def _tail(path: str, nbytes: int = 512 * 1024) -> str:
         return f.read().decode("utf-8", "replace")
 
 
-# primary/secondary 是目前见过的全部窗口键，但同样不做白名单：
-# 任何带 used_percent 的字典都当成一条限额显示。
-_CODEX_LABELS = {"primary": "5h", "secondary": "wk"}
+# 键名 primary/secondary 只是位置，不代表窗口长度 —— 换套餐会变。
+# 实测 prolite 计划的 primary 是 10080 分钟（周窗），secondary 为 null；
+# 而 plus 计划的 primary 是 300 分钟（5 小时窗）。所以标签必须由
+# window_minutes 推出来，按键名硬编码会把周额度标成 5h。
+_CODEX_FALLBACK_LABELS = {"primary": "主", "secondary": "次"}
+
+
+def _window_label(blk: dict, key: str) -> str:
+    wm = blk.get("window_minutes")
+    if isinstance(wm, (int, float)) and wm > 0:
+        wm = int(wm)
+        if wm >= 10080 and wm % 10080 == 0:
+            n = wm // 10080
+            return "wk" if n == 1 else "%dwk" % n
+        if wm >= 1440:
+            return "%dd" % round(wm / 1440)
+        if wm >= 60:
+            return "%dh" % round(wm / 60)
+        return "%dm" % wm
+    return _CODEX_FALLBACK_LABELS.get(key, key.replace("_", " ")[:8])
 
 
 def _parse_codex_limits(rl: dict) -> "list[Reading]":
-    out = []
+    ranked = []
     for key, blk in rl.items():
-        if not isinstance(blk, dict):
+        if not isinstance(blk, dict) or blk.get("used_percent") is None:
             continue
-        if blk.get("used_percent") is None:
-            continue
-        out.append(Reading(
-            "chatgpt", _CODEX_LABELS.get(key, key.replace("_", " ")[:8]),
-            float(blk["used_percent"]), blk.get("resets_at"),
+        wm = blk.get("window_minutes")
+        ranked.append((
+            wm if isinstance(wm, (int, float)) else 1 << 30,
+            Reading("chatgpt", _window_label(blk, key),
+                    float(blk["used_percent"]), blk.get("resets_at")),
         ))
-    # 排序：认识的窗口在前，其余按名字排，保证行序稳定不会每次刷新乱跳
-    order = {"5h": 0, "wk": 1}
-    out.sort(key=lambda r: (order.get(r.label, 2), r.label))
+    # 短窗口排前面。行序必须稳定，否则每次刷新都会跳
+    ranked.sort(key=lambda t: t[0])
+    out = [r for _, r in ranked]
 
     # 付费余量：只有真的启用了才占一行，否则一直显示 "余额 0" 是噪音。
     # 它是绝对值不是百分比，走 text 字段，前端不给它画进度条。

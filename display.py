@@ -49,17 +49,12 @@ def dimmed(hex_color: str, t: float = 0.55) -> str:
     return "#%02x%02x%02x" % (mix(fr, br), mix(fg_, bg_), mix(fb, bb))
 
 
-WEEKDAYS = "一二三四五六日"
-
-
 def fmt_reset(resets_at: Optional[float]) -> str:
     """把重置时刻格式化成本地绝对时间。
 
     倒计时（"5d"）看着紧凑，但没法指导行动 —— 你不知道该不该今晚省着用。
-    具体钟点才有用。按距离远近给不同精度，省列宽：
-        今天      -> "19:19"
-        一周内    -> "周二 02:00"
-        更远      -> "09-15 02:00"
+        今天   -> "19:19"
+        其他   -> "09-15 02:00"
     """
     if resets_at is None:
         return ""
@@ -72,8 +67,6 @@ def fmt_reset(resets_at: Optional[float]) -> str:
         return ""                       # 已经重置过，该行已用 ↺ 标记
     if t.date() == now.date():
         return t.strftime("%H:%M")
-    if (t - now).days < 7:
-        return "周%s %s" % (WEEKDAYS[t.weekday()], t.strftime("%H:%M"))
     return t.strftime("%m-%d %H:%M")
 
 

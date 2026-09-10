@@ -23,7 +23,9 @@ CONFIG = os.path.join(sources.data_dir(), "config_qt.json")
 W = 300
 PAD_X, ROW_H, TOP = 11, 22, 8
 X_LABEL, X_PCT = 42, 150
-BAR_X0, BAR_X1, BAR_H = 158, 226, 6
+# 进度条右边界要给 "09-15 01:59" 留够宽度（约 70px）。条是装饰、时间是信息，
+# 宽度不够时先牺牲条。
+BAR_X0, BAR_X1, BAR_H = 158, 204, 6
 X_RESET_END = W - PAD_X
 MIN_ROWS = 4                    # 高度基准，实际行数少于它时也不至于窄成一条
 # 额度百分比变化很慢，而 /api/oauth/usage 有速率限制 —— 60 秒轮询纯属自伤。

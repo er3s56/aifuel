@@ -119,6 +119,18 @@ MIT，见 [LICENSE](LICENSE)。
 
 ## 已知限制
 
+**ChatGPT 的窗口标签由 `window_minutes` 推出，不看键名。** 不同套餐的
+`rate_limits` 结构不一样：`plus` 的 `primary` 是 300 分钟（5 小时窗），
+而 `prolite` 的 `primary` 是 10080 分钟（周窗）且 `secondary` 为 `null`。
+按 `primary`/`secondary` 硬编码标签会把周额度标成 5h。
+
+**Luna Reserve 拿不到。** ChatGPT 桌面端侧边栏那个 "Luna Reserve · 剩余 N%"
+来自 `additional_rate_limits[].rate_limit.primary_window`（字段名从
+`app.asar` 里的 `sidebarElectron.lunaReserve.*` 一路追出来的）。但 Codex CLI
+的会话日志**从不下发这个字段**（实测 106 个会话全无），它只存在于桌面端向
+`backend-api` 拉取的响应里。要显示它得调那个内部接口，而该接口有 Sentinel
+反爬机制，不值得。
+
 - Claude 那个接口是非公开的，Claude Code 大版本更新后可能变。真变了的话，
   `sources.py` 里 `USAGE_URL` / `OAUTH_BETA` 是要改的地方。
 - 125% 等 DPI 缩放下正常（布局按窗口实际逻辑尺寸算）。
