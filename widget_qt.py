@@ -17,6 +17,8 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 import autostart
 import display
 import sources
+import taskbar_view
+from taskbar import WindowsTaskbar, light_theme
 
 CONFIG = os.path.join(sources.data_dir(), "config_qt.json")
 
@@ -59,9 +61,18 @@ class QuotaWidget(QWidget):
         self.readings: list = []
         self.loading = True
         self._drag_pos = None
+        self._taskbar = None
+        self._docked = False
+        self._taskbar_note = ""
+        self._taskbar_columns = taskbar_view.measure([])
+        self._taskbar_light = light_theme()
+        self._last_taskbar_position = None
+        self._display_signature = None
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("aifuel")
         self.resize(W, TOP * 2 + MIN_ROWS * ROW_H)
 
         screen = QApplication.primaryScreen().availableGeometry()
@@ -77,6 +88,10 @@ class QuotaWidget(QWidget):
         self.display_timer.start(1000)
         self._thread = None
         self._closing = False
+        self.taskbar_timer = QTimer(self)
+        self.taskbar_timer.timeout.connect(self._sync_taskbar)
+        if self.cfg.get("taskbar") and os.name == "nt":
+            self.taskbar_timer.start(250)
         QApplication.instance().aboutToQuit.connect(self._wait_for_fetch)
         self.refresh()
 
@@ -85,7 +100,8 @@ class QuotaWidget(QWidget):
     def _load_cfg(self) -> dict:
         try:
             with open(CONFIG, encoding="utf-8") as f:
-                return json.load(f)
+                value = json.load(f)
+                return value if isinstance(value, dict) else {}
         except Exception:
             return {}
 
@@ -120,6 +136,8 @@ class QuotaWidget(QWidget):
         self._closing = True
         self.timer.stop()
         self.display_timer.stop()
+        self.taskbar_timer.stop()
+        self._release_taskbar()
         if self._thread is not None:
             self._thread.wait()
 
@@ -127,6 +145,8 @@ class QuotaWidget(QWidget):
         self._closing = True
         self.timer.stop()
         self.display_timer.stop()
+        self.taskbar_timer.stop()
+        self._release_taskbar()
         if self._thread is not None:
             self.hide()
             event.ignore()             # 取数结束后由 _fetch_finished 再次关闭
@@ -139,8 +159,16 @@ class QuotaWidget(QWidget):
 
     def _update_display(self) -> None:
         if not self._closing:
-            self.setToolTip(display.details(self.readings))
-            self.update()
+            self._taskbar_light = light_theme()
+            detail = display.details(self.readings)
+            tooltip = (self._taskbar_note + "\n\n" if self._taskbar_note else "") + detail
+            if self.toolTip() != tooltip:
+                self.setToolTip(tooltip)
+            signature = (self.loading, self._docked, self._taskbar_light,
+                         [(r.provider, r.label, display.resolve(r), display.status_text(r)) for r in self.readings])
+            if signature != self._display_signature:
+                self._display_signature = signature
+                self.update()
 
     def _apply(self, data: list, schedule=True) -> None:
         if self._closing:
@@ -148,12 +176,13 @@ class QuotaWidget(QWidget):
         if data:
             self.readings = data
         self.loading = False
+        self._taskbar_columns = taskbar_view.measure(self.readings)
         # 行数随服务端返回的限额条数变化（多一条 Fable、多一条余额都可能），
         # 所以每轮取完数都要按实际行数重算窗口高度
-        rows = max(MIN_ROWS, len(self.readings))
-        want_h = TOP * 2 + rows * ROW_H
-        if self.height() != want_h:
-            self.resize(W, want_h)
+        if self.taskbar_timer.isActive():
+            self._sync_taskbar()
+        else:
+            self._resize_floating()
         self._update_display()
         if schedule:
             wait = sources.backoff_remaining()
@@ -161,8 +190,95 @@ class QuotaWidget(QWidget):
 
     # ------------------------------------------------ 交互
 
+    def _resize_floating(self):
+        want_h = TOP * 2 + max(MIN_ROWS, len(self.readings)) * ROW_H
+        if self.width() != W or self.height() != want_h:
+            self.resize(W, want_h)
+
+    def _restore_floating(self):
+        self._release_taskbar()
+        self._ensure_native_window()
+        self._docked = False
+        self._last_taskbar_position = None
+        self._resize_floating()
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(self.cfg.get("x", screen.right() - W - 24), self.cfg.get("y", 48))
+        self.setWindowOpacity(self.cfg.get("alpha", 0.94))
+        self.show()
+
+    def _release_taskbar(self):
+        if self._taskbar is not None:
+            try:
+                self._taskbar.detach()
+            except OSError:
+                pass  # Explorer 或窗口已经退出时仍须正常关闭 aifuel。
+
+    def _ensure_native_window(self):
+        hwnd = int(self.winId())
+        if self._taskbar is not None and not self._taskbar.is_our_window(hwnd):
+            # owner 被销毁可能连带销毁原生窗口，而 QWidget 仍保留旧句柄。
+            # 重建窗口表面，保留读数、计时器和正在进行的请求。
+            self._release_taskbar()
+            self.hide()
+            self.destroy()
+            self.create()
+            self._last_taskbar_position = None
+            hwnd = int(self.winId())
+        return hwnd
+
+    def _set_taskbar(self, enabled):
+        self.cfg["taskbar"] = bool(enabled)
+        self._save_cfg()
+        self._drag_pos = None
+        if enabled:
+            self.taskbar_timer.start(250)
+            self._sync_taskbar()
+        else:
+            self.taskbar_timer.stop()
+            self._taskbar_note = ""
+            self._restore_floating()
+        self._update_display()
+
+    def _sync_taskbar(self):
+        if self._closing:
+            return
+        width = taskbar_view.width(self._taskbar_columns)
+        try:
+            if self._taskbar is None:
+                self._taskbar = WindowsTaskbar()
+            hwnd = self._ensure_native_window()
+            placement = self._taskbar.placement(width)
+            self._taskbar_note = placement.reason
+            if placement.state == "hidden":
+                if self.isVisible():
+                    self.hide()
+                self._last_taskbar_position = None
+                return
+            if placement.state == "docked":
+                changed_mode = not self._docked
+                self._docked = True
+                if changed_mode:
+                    self.setWindowOpacity(1.0)
+                position = (placement.rect, placement.taskbar_hwnd)
+                if position != self._last_taskbar_position or not self.isVisible():
+                    self._taskbar.move(hwnd, placement.rect)
+                    if not self.isVisible():
+                        self.show()
+                    # Qt 显示/重建原生窗口时会设置 owner，必须在 show 之后绑定。
+                    self._taskbar.attach(int(self.winId()), placement.taskbar_hwnd)
+                    self._last_taskbar_position = position
+                if changed_mode:
+                    self.update()
+                return
+        except OSError:
+            self._taskbar_note = "任务栏定位失败，暂以悬浮窗显示"
+        if self._docked or not self.isVisible():
+            self._restore_floating()
+        else:
+            self._resize_floating()
+
     def mousePressEvent(self, e) -> None:
-        if e.button() == Qt.LeftButton:
+        if e.button() == Qt.LeftButton and not self._docked:
             self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e) -> None:
@@ -186,7 +302,13 @@ class QuotaWidget(QWidget):
         detail_action = m.addAction("额度详情（百分比为已用）")
         detail_action.triggered.connect(lambda: QMessageBox.information(
             self, "额度详情", display.details(self.readings)))
+        taskbar_action = m.addAction("显示在任务栏（托盘左侧）")
+        taskbar_action.setCheckable(True)
+        taskbar_action.setChecked(bool(self.cfg.get("taskbar")))
+        taskbar_action.setEnabled(os.name == "nt")
+        taskbar_action.triggered.connect(self._set_taskbar)
         sub = m.addMenu("不透明度")
+        sub.setEnabled(not self._docked)
         for a in (1.0, 0.94, 0.8, 0.6):
             act = QAction("%d%%" % (a * 100), self)
             act.triggered.connect(lambda _c=False, v=a: self._set_alpha(v))
@@ -220,6 +342,10 @@ class QuotaWidget(QWidget):
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
+        if self._docked:
+            taskbar_view.paint(p, QRectF(self.rect()), self.readings, self._taskbar_columns,
+                               self._taskbar_light, self.loading)
+            return
 
         # 一律用窗口的「逻辑」尺寸算布局。在 125%/150% DPI 缩放下，
         # resize() 拿到的物理像素和绘制用的逻辑坐标不是一回事，
@@ -344,7 +470,14 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
     w = QuotaWidget()
-    w.show()
+    if "--taskbar" in sys.argv:
+        w._set_taskbar(True)
+    elif "--floating" in sys.argv:
+        w._set_taskbar(False)
+    elif w.taskbar_timer.isActive():
+        w._sync_taskbar()
+    else:
+        w.show()
     sys.exit(app.exec())
 
 

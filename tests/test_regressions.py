@@ -195,7 +195,7 @@ class AutostartTests(IsolatedTest):
 
 @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 not installed")
 class QtTests(IsolatedTest):
-    def run_qt(self, body):
+    def run_qt(self, body, platform="offscreen"):
         script = """
 import ctypes, sys, threading, time
 if sys.platform == 'win32':
@@ -216,7 +216,7 @@ def drain_until(predicate):
 """ + body
         result = subprocess.run(
             [sys.executable, "-c", script], cwd=PROJECT,
-            env=dict(os.environ, QT_QPA_PLATFORM="offscreen", LOCALAPPDATA=str(self.state)),
+            env=dict(os.environ, QT_QPA_PLATFORM=platform, LOCALAPPDATA=str(self.state)),
             capture_output=True, text=True, timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -287,6 +287,166 @@ assert w._thread is None or not w._thread.isRunning()
 
     def test_application_quit_during_fetch_exits_cleanly(self):
         self.check_quit_during_fetch("app.quit")
+
+    def test_taskbar_keeps_every_reading_and_restores_floating_position(self):
+        self.run_qt("""
+from taskbar import Rect, Placement
+from unittest.mock import patch
+items = [sources.Reading('claude', label, 20, observed_at=time.time())
+         for label in ['5h', 'wk', 'Fable']]
+items += [sources.Reading('chatgpt', 'wk', 30, observed_at=time.time()),
+          sources.Reading('chatgpt', '余额', None, text='$12', observed_at=time.time())]
+calls = []
+def read(on_result=None):
+    calls.append(1)
+    return items
+sources.read_all = read
+w = widget_qt.QuotaWidget()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+w.cfg.update(x=40, y=60)
+w.move(40, 60)
+
+class Taskbar:
+    state = 'docked'
+    moves = 0
+    owner = None
+    def is_our_window(self, hwnd):
+        return True
+    def placement(self, width):
+        return Placement(self.state, Rect(100, 100, 100 + width, 148), '测试降级', 123)
+    def attach(self, hwnd, owner):
+        self.owner = owner
+    def detach(self):
+        self.owner = None
+    def move(self, hwnd, rect):
+        self.moves += 1
+        w.setGeometry(rect.left, rect.top, rect.width, rect.height)
+w._taskbar = Taskbar()
+w._set_taskbar(True)
+assert w._docked and w.width() > 300 and w.height() == 48
+assert w.width() == widget_qt.taskbar_view.width(w._taskbar_columns)
+assert w._taskbar.owner == 123
+with patch.object(w, 'update') as repaint:
+    for _ in range(20):
+        w._sync_taskbar()
+        w._update_display()
+    assert w._taskbar.moves == 1, 'Unchanged taskbar must not repeatedly move the window'
+    repaint.assert_not_called()
+layout = w._taskbar_columns
+items[0].percent = 100
+items[0].stale = True
+assert widget_qt.taskbar_view.measure(items) == layout, 'Percentage changes must not resize columns'
+assert w.cfg['x'] == 40 and w.cfg['y'] == 60
+with patch.object(widget_qt.display, 'resolve', wraps=widget_qt.display.resolve) as resolve:
+    w.grab()
+    assert [c.args[0] for c in resolve.call_args_list] == items
+w._taskbar.state = 'hidden'
+w._sync_taskbar()
+assert not w.isVisible()
+w._taskbar.state = 'docked'
+w._sync_taskbar()
+assert w.isVisible() and w._docked
+assert w._taskbar.moves == 2, 'Returning from hidden mode must restore placement'
+w._taskbar.state = 'fallback'
+w._sync_taskbar()
+assert not w._docked and w.width() == 300 and w.height() == 126
+assert w._taskbar.owner is None
+assert w.x() == 40 and w.y() == 60
+w._taskbar.state = 'docked'
+w._sync_taskbar()
+assert w._docked
+w._set_taskbar(False)
+assert not w.taskbar_timer.isActive() and not w._docked
+assert w.x() == 40 and w.y() == 60 and w.width() == 300
+assert len(calls) == 1, 'Changing display mode must not query quotas'
+w.close()
+assert not w.taskbar_timer.isActive()
+assert w._taskbar.owner is None
+""")
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows native window test')
+    def test_taskbar_stacking_and_owner_recreation(self):
+        # 自建屏幕外窗口模拟任务栏；不点击、移动或重启用户的 Explorer。
+        self.run_qt("""
+from ctypes import wintypes as wt
+from taskbar import WindowsTaskbar, Placement, Rect
+calls = []
+items = [sources.Reading('chatgpt', 'wk', 30)]
+def read(on_result=None):
+    calls.append(1)
+    return items
+sources.read_all = read
+w = widget_qt.QuotaWidget()
+w.cfg.update(x=-32000, y=-32000)
+w.move(-32000, -32000)
+w.show()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+
+class Taskbar(WindowsTaskbar):
+    owner = 0
+    def placement(self, width):
+        return (Placement('docked', Rect(-32000, -32000, -31600, -31950), '', self.owner)
+                if self.owner else Placement('hidden'))
+backend = w._taskbar = Taskbar()
+api = backend.api
+api.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wt.HWND, wt.HMENU, wt.HINSTANCE, ctypes.c_void_p]
+api.CreateWindowExW.restype = wt.HWND
+api.DestroyWindow.argtypes = [wt.HWND]
+def create_owner():
+    handle = api.CreateWindowExW(8, 'STATIC', 'aifuel-test', 0x90000000,
+        -32000, -32000, 400, 50, None, None, None, None)
+    assert handle, 'Cannot create native test window'
+    return handle
+def raise_owner():
+    assert api.SetWindowPos(backend.owner, wt.HWND(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
+def above_owner():
+    hwnd = int(w.winId())
+    previous = api.GetWindow(backend.owner, 3)
+    while previous:
+        if previous == hwnd:
+            return True
+        previous = api.GetWindow(previous, 3)
+    return False
+
+backend.owner = create_owner()
+original_owner = api.GetWindow(int(w.winId()), 4) or 0
+try:
+    raise_owner()
+    assert not above_owner(), 'Control must reproduce the original overlap'
+    w._sync_taskbar()
+    assert above_owner(), 'Initial attachment must place quota window above taskbar'
+    for _ in range(20):
+        raise_owner()
+        # 在 Qt 计时器补偿之前立即验证，不能只测轮询后的最终层级。
+        assert above_owner(), 'Taskbar raise temporarily covered quota window'
+    w._restore_floating()
+    assert (api.GetWindow(int(w.winId()), 4) or 0) == original_owner
+    w._sync_taskbar()
+    for hidden_gap in [True, False]:
+        assert api.DestroyWindow(backend.owner)
+        backend.owner = 0
+        app.processEvents()
+        if hidden_gap:
+            w._sync_taskbar()
+            assert not w.isVisible()
+        backend.owner = create_owner()
+        w._sync_taskbar()
+        app.processEvents()
+        assert backend.is_our_window(int(w.winId())) and w.isVisible()
+        assert w._docked and w.readings == items and not w._closing
+        assert api.GetWindow(int(w.winId()), 4) == backend.owner
+        raise_owner()
+        assert above_owner()
+    assert len(calls) == 1, 'Window recovery must preserve quota requests'
+finally:
+    w.close()
+    if backend.owner:
+        api.DestroyWindow(backend.owner)
+""", platform="windows")
 
 
 @unittest.skipUnless(sys.platform == "win32" and (PROJECT / "dist/aifuel/aifuel.exe").is_file(),
