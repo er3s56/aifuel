@@ -34,28 +34,28 @@ class FailurePolicyTests(IsolatedTest):
             with self.subTest(provider=provider):
                 self.clock.return_value = 2000
                 first = read()[0]
-                self.clock.return_value = 2030
+                self.clock.return_value = 2120
                 fetch.side_effect = TimeoutError("do not leak transport internals")
                 failed = read()[0]
                 self.assertEqual(failed.percent, first.percent)
                 self.assertEqual(failed.observed_at, 2000)
-                self.assertEqual(failed.retry_at, 2060)
+                self.assertEqual(failed.retry_at, 2150)
                 self.assertIn("超时", failed.detail)
                 self.assertEqual(display.status_text(failed), "缓存")
                 calls = fetch.call_count
                 for _ in range(3):
                     read()
                 self.assertEqual(fetch.call_count, calls, "Manual refresh bypassed backoff")
-                self.clock.return_value = 2060
+                self.clock.return_value = 2150
                 failed = read()[0]
-                self.assertEqual(failed.retry_at, 2120)
+                self.assertEqual(failed.retry_at, 2210)
                 fetch.side_effect = None
-                self.clock.return_value = 2120
+                self.clock.return_value = 2210
                 recovered = read()[0]
                 self.assertFalse(recovered.stale)
                 self.assertIsNone(recovered.detail)
                 self.assertIsNone(recovered.retry_at)
-                self.assertEqual(recovered.observed_at, 2120)
+                self.assertEqual(recovered.observed_at, 2210)
                 self.assertEqual(sources._retry_states[provider].step, 0)
 
     def test_limit_wait_is_respected_even_by_manual_refresh_and_credential_changes(self):
@@ -69,6 +69,45 @@ class FailurePolicyTests(IsolatedTest):
         self.clock.return_value = 9200
         sources.read_claude()
         self.assertEqual(self.claude.call_count, 2)
+
+    def test_zero_and_short_retry_after_never_cancel_exponential_backoff(self):
+        for read, fetch in ((sources.read_claude, self.claude), (sources.read_codex, self.codex)):
+            self.clock.return_value = 2000
+            fetch.side_effect = QueryError("限流", "rate_limit", retry_after=0)
+            first = read()[0]
+            self.assertEqual(first.retry_at, 2090)
+            for now in (2000, 2030, 2089):
+                self.clock.return_value = now
+                read()
+            self.assertEqual(fetch.call_count, 1)
+            self.clock.return_value = 2090
+            fetch.side_effect = QueryError("限流", "rate_limit", retry_after=1)
+            self.assertEqual(read()[0].retry_at, 2270)
+            self.assertEqual(fetch.call_count, 2)
+
+    def test_claude_queries_at_most_every_two_minutes_without_delaying_gpt(self):
+        first = sources.read_claude()[0]
+        for now in (2000, 2030, 2060, 2119):
+            self.clock.return_value = now
+            current = sources.read_claude()[0]
+            self.assertFalse(current.stale)
+            self.assertEqual(current.observed_at, first.observed_at)
+            sources.read_codex()
+        self.claude.assert_called_once()
+        self.assertEqual(self.codex.call_count, 4)
+        self.clock.return_value = 2120
+        self.assertEqual(sources.read_claude()[0].observed_at, 2120)
+        self.assertEqual(self.claude.call_count, 2)
+
+    def test_recent_disk_sample_prevents_request_burst_after_restart(self):
+        sources.read_claude()
+        with patch.object(sources, "_memory_samples", {}), patch.object(sources, "_retry_states", {
+                name: RetryState() for name in ("claude", "chatgpt")}):
+            self.clock.return_value = 2010
+            result = sources.read_claude()[0]
+        self.claude.assert_called_once()
+        self.assertEqual(result.observed_at, 2000)
+        self.assertFalse(result.stale)
 
     def test_both_providers_use_same_rate_limit_backoff(self):
         for read, fetch in ((sources.read_claude, self.claude), (sources.read_codex, self.codex)):
@@ -108,6 +147,7 @@ class FailurePolicyTests(IsolatedTest):
     def test_malformed_response_preserves_cache_and_reason(self):
         for read, fetch in ((sources.read_claude, self.claude), (sources.read_codex, self.codex)):
             first = read()[0]
+            self.clock.return_value += 120
             fetch.return_value = [] if read == sources.read_claude else {}
             failed = read()[0]
             self.assertEqual(failed.percent, first.percent)

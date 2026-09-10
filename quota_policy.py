@@ -7,6 +7,7 @@ import time
 
 
 CACHE_TTL = 300.0
+CLAUDE_POLL_INTERVAL = 120.0
 RETRY_FIRST = 30.0
 RATE_LIMIT_FIRST = 90.0
 RETRY_MAX = 900.0
@@ -59,5 +60,6 @@ class RetryState:
         else:
             first = RATE_LIMIT_FIRST if error.kind == "rate_limit" else RETRY_FIRST
             self.step = min(RETRY_MAX, max(first, self.step * 2))
-            delay = error.retry_after if error.retry_after is not None else self.step
+            # Retry-After 是服务端要求的最短等待，不能用 0 或过短的值取消本地退避。
+            delay = max(self.step, error.retry_after or 0.0)
         self.retry_at = now + delay

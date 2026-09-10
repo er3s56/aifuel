@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 from codex_live import CodexClient
-from quota_policy import QueryError, RetryState, retry_after_seconds
+from quota_policy import CLAUDE_POLL_INTERVAL, QueryError, RetryState, retry_after_seconds
 
 HOME = os.path.expanduser("~")
 CLAUDE_CREDS = os.path.join(HOME, ".claude", ".credentials.json")
@@ -179,7 +179,7 @@ def _fallback(provider, state):
     return readings
 
 
-def _query_provider(provider, fetch, timeout):
+def _query_provider(provider, fetch, timeout, min_interval=0):
     with _provider_locks[provider]:
         state = _retry_states[provider]
         stamp = _credential_stamp(provider)
@@ -190,6 +190,16 @@ def _query_provider(provider, fetch, timeout):
                 _codex_client.close()
         if time.time() < state.retry_at:
             return _fallback(provider, state)
+        if min_interval and not state.kind:
+            cached = [r for r in _from_cache(provider) if r.source == "api"]
+            now = time.time()
+            if cached and all(r.observed_at is not None and
+                              0 <= now - r.observed_at < min_interval for r in cached):
+                # 正常查询间隔内沿用最近成功值；不是失败降级，不改变采样时间。
+                # 根据采样时间判断，手动刷新和程序重启也不会制造额外请求。
+                for reading in cached:
+                    reading.stale = False
+                return cached
         try:
             readings = fetch(timeout)
             _validate_readings(readings)
@@ -228,7 +238,7 @@ def _iso_to_epoch(s: Optional[str]) -> Optional[float]:
 
 
 def read_claude(timeout: float = 12.0) -> "list[Reading]":
-    return _query_provider("claude", _fetch_claude, timeout)
+    return _query_provider("claude", _fetch_claude, timeout, min_interval=CLAUDE_POLL_INTERVAL)
 
 
 def _fetch_claude(timeout):
