@@ -125,7 +125,7 @@ class FailurePolicyTests(IsolatedTest):
                 self.stamp.return_value = b"old"
                 fetch.side_effect = QueryError("请重新登录", "auth")
                 reading = read()[0]
-                self.assertEqual(display.status_text(reading), "需登录")
+                self.assertEqual(display.status_text(reading), "需授权" if provider == "claude" else "需登录")
                 read()
                 self.assertEqual(fetch.call_count, 1)
                 self.stamp.return_value = b"new"

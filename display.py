@@ -126,7 +126,7 @@ def resolve(r: Reading) -> Resolved:
 def status_text(reading: Reading) -> str:
     """主面板右侧：失败时优先显示状态，正常时显示重置时刻。"""
     if reading.failure_kind == "auth":
-        return "需登录"
+        return "需授权" if reading.provider == "claude" else "需登录"
     if reading.failure_kind == "rate_limit":
         return "限流等待"
     if reading.error:

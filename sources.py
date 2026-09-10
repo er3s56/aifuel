@@ -2,8 +2,7 @@
 """额度数据层：Claude(OAuth API) + ChatGPT/Codex(账户实时查询)。
 
 设计约束：
-  * 对 ~/.claude/.credentials.json 只读，永不写入 —— 避免与 Claude Code
-    抢 refresh token 轮换导致登出。token 过期时退化为读磁盘缓存。
+  * Claude 凭证只读；续期交给官方 CLI 协调锁与 token 轮换，不自行写入。
   * 按需取键、忽略未知键 —— 服务端随时会加新的限制类型。
 """
 from __future__ import annotations
@@ -24,10 +23,12 @@ from datetime import datetime
 from typing import Optional
 
 from codex_live import CodexClient
+import claude_auth
 from quota_policy import CLAUDE_POLL_INTERVAL, QueryError, RetryState, retry_after_seconds
 
 HOME = os.path.expanduser("~")
-CLAUDE_CREDS = os.path.join(HOME, ".claude", ".credentials.json")
+CLAUDE_CREDS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"),
+                            ".credentials.json")
 
 
 def data_dir() -> str:
@@ -242,18 +243,17 @@ def read_claude(timeout: float = 12.0) -> "list[Reading]":
 
 
 def _fetch_claude(timeout):
-    try:
-        with open(CLAUDE_CREDS, encoding="utf-8") as f:
-            oauth = json.load(f)["claudeAiOauth"]
-        token = oauth["accessToken"]
-        expiry = float(oauth["expiresAt"]) / 1000
-        if not isinstance(token, str) or not token or not math.isfinite(expiry):
-            raise ValueError("invalid credentials")
-    except (OSError, ValueError, KeyError, TypeError, OverflowError):
-        raise QueryError("无法读取有效登录凭证，请登录 Claude Code", "auth") from None
-    if time.time() >= expiry:
-        raise QueryError("Claude 登录已过期，请打开 Claude Code 更新登录", "auth")
+    token = claude_auth.access_token(CLAUDE_CREDS, data_dir())
+    for attempt in range(2):
+        try:
+            return _parse_claude_limits(_request_claude_usage(token, timeout))
+        except QueryError as error:
+            if error.kind != "auth" or attempt:
+                raise
+            token = claude_auth.access_token(CLAUDE_CREDS, data_dir(), rejected_token=token)
 
+
+def _request_claude_usage(token, timeout):
     req = urllib.request.Request(USAGE_URL, headers={
         "Authorization": "Bearer %s" % token,
         "anthropic-beta": OAUTH_BETA,
@@ -270,11 +270,11 @@ def _fetch_claude(timeout):
             raise QueryError("额度接口限流，等待后自动重试", "rate_limit",
                              retry_after) from None
         if e.code == 401:
-            raise QueryError("Claude 登录已失效，请重新登录 Claude Code", "auth") from None
+            raise QueryError("Claude 授权已失效，需要重新授权", "auth") from None
         if e.code == 403:
             raise QueryError("额度接口拒绝访问，请检查账户权限", "setup") from None
         raise QueryError("额度接口返回 HTTP %s" % e.code) from None
-    return _parse_claude_limits(payload)
+    return payload
 
 
 # 已知 kind 的短标签。不在表里的 kind 不会被丢掉，会用 kind 名本身当标签 ——
