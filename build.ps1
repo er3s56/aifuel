@@ -30,7 +30,10 @@ $excludes = @(
   "PySide6.QtPrintSupport", "PySide6.QtSvg", "PySide6.QtSvgWidgets", "PySide6.QtDBus",
   "PySide6.QtXml", "PySide6.QtConcurrent", "PySide6.QtHelp", "PySide6.QtUiTools",
   "PySide6.QtDesigner", "PySide6.QtCharts", "PySide6.QtMultimedia",
-  "tkinter", "unittest", "pydoc", "doctest", "pdb", "PIL"
+  "tkinter", "unittest", "pydoc", "doctest", "pdb", "PIL",
+  # autostart.py 刻意走 PowerShell 而不是 pywin32：少 7.7MB，且源码模式和
+  # exe 模式走同一条代码路径（否则总有一条没被真正测过）。
+  "win32com", "win32comext", "pythoncom", "pywintypes", "win32api", "win32gui"
 )
 
 $name = if ($Debug) { "aifuel_debug" } else { "aifuel" }

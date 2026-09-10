@@ -12,8 +12,9 @@ import sys
 
 from PySide6.QtCore import QObject, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 
+import autostart
 import display
 import sources
 
@@ -146,11 +147,24 @@ class QuotaWidget(QWidget):
             act = QAction("%d%%" % (a * 100), self)
             act.triggered.connect(lambda _c=False, v=a: self._set_alpha(v))
             sub.addAction(act)
+
+        act = QAction("开机自启", self)
+        act.setCheckable(True)
+        act.setChecked(autostart.is_enabled())      # 状态直接读快捷方式是否存在
+        act.triggered.connect(self._toggle_autostart)
+        m.addAction(act)
+
         m.addSeparator()
         act = QAction("退出", self)
         act.triggered.connect(QApplication.quit)
         m.addAction(act)
         m.exec(e.globalPos())
+
+    def _toggle_autostart(self, checked: bool) -> None:
+        ok, msg = autostart.enable() if checked else autostart.disable()
+        if not ok:
+            # 失败必须告诉用户 —— 静默失败会让人以为设好了，开机才发现没有
+            QMessageBox.warning(self, "开机自启", msg)
 
     def _set_alpha(self, v: float) -> None:
         self.cfg["alpha"] = v
@@ -246,6 +260,32 @@ class QuotaWidget(QWidget):
 
 
 def main() -> None:
+    # 诊断入口：不开窗口，直接查/改开机自启。GUI 里点菜单不便于自动化验证，
+    # 而"打包后还能不能正常建快捷方式"必须在真实的冻结进程里测过才算数。
+    if len(sys.argv) > 1 and sys.argv[1] == "--autostart":
+        arg = sys.argv[2] if len(sys.argv) > 2 else "status"
+        tgt, wd = autostart.target()
+        lines = ["frozen   : %s" % getattr(sys, "frozen", False),
+                 "target   : %s (存在: %s)" % (tgt, os.path.exists(tgt)),
+                 "workdir  : %s" % wd,
+                 "link     : %s" % autostart.link_path(),
+                 "enabled  : %s" % autostart.is_enabled()]
+        if arg in ("on", "off"):
+            ok, msg = autostart.enable() if arg == "on" else autostart.disable()
+            lines += ["%s -> %s: %s" % (arg, "OK" if ok else "失败", msg),
+                      "enabled  : %s" % autostart.is_enabled()]
+        report = "\n".join(lines)
+        # --windowed 打包后 sys.stdout 是 None，print 会抛异常，所以写文件为主
+        try:
+            with open(os.path.join(sources.data_dir(), "autostart-report.txt"),
+                      "w", encoding="utf-8") as f:
+                f.write(report + "\n")
+        except Exception:
+            pass
+        if sys.stdout is not None:
+            print(report)
+        sys.exit(0)
+
     if not sources.acquire_single_instance():
         sys.exit(0)                 # 已经有一份在跑，静默退出
     app = QApplication(sys.argv)

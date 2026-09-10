@@ -9,7 +9,9 @@ import json
 import os
 import threading
 import tkinter as tk
+from tkinter import messagebox
 
+import autostart
 import display
 import sources
 
@@ -93,9 +95,23 @@ class QuotaWidget:
         for a in (1.0, 0.9, 0.75, 0.6):
             sub.add_command(label="%d%%" % (a * 100), command=lambda v=a: self._alpha(v))
         m.add_cascade(label="不透明度", menu=sub)
+
+        # 状态直接读快捷方式是否存在，不落配置文件
+        self._auto_var = tk.BooleanVar(value=autostart.is_enabled())
+        m.add_checkbutton(label="开机自启", variable=self._auto_var,
+                          command=self._toggle_autostart)
+
         m.add_separator()
         m.add_command(label="退出", command=self.root.destroy)
         m.tk_popup(e.x_root, e.y_root)
+
+    def _toggle_autostart(self) -> None:
+        want = self._auto_var.get()
+        ok, msg = autostart.enable() if want else autostart.disable()
+        if not ok:
+            # 失败必须告诉用户 —— 静默失败会让人以为设好了，开机才发现没有
+            messagebox.showwarning("开机自启", msg, parent=self.root)
+            self._auto_var.set(autostart.is_enabled())
 
     def _alpha(self, v: float) -> None:
         self.cfg["alpha"] = v
