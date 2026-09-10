@@ -25,8 +25,8 @@ X_TAG, X_LABEL, X_PCT = 9, 42, 146
 BAR_X0, BAR_X1, BAR_H = 154, 200, 5
 X_RESET = W - 9
 MIN_ROWS = 4                      # 高度基准，行数少时也不至于窄成一条
-# 额度百分比变化很慢，而 /api/oauth/usage 有速率限制 —— 60 秒轮询纯属自伤。
-REFRESH_SEC = 300
+# 30 秒。理由与取舍见 widget_qt.py 里同名常量的注释（退避充当限流器）。
+REFRESH_SEC = 30
 
 
 def load_config() -> dict:
@@ -134,7 +134,7 @@ class QuotaWidget:
     def _apply(self, data: list) -> None:
         self.readings, self.loading = data, False
         self.draw()
-        # 退避中就掐着退避到期的点重试，别白等一整个刷新周期
+        # 取 min 的用意见 widget_qt.py 同处注释（当前 30s 间隔下总是取 REFRESH_SEC）
         wait = sources.backoff_remaining()
         delay = min(REFRESH_SEC, wait + 5) if wait else REFRESH_SEC
         self.root.after(int(delay * 1000), self.refresh)

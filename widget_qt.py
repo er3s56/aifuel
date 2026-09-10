@@ -29,8 +29,13 @@ X_LABEL, X_PCT = 42, 150
 BAR_X0, BAR_X1, BAR_H = 158, 204, 6
 X_RESET_END = W - PAD_X
 MIN_ROWS = 4                    # 高度基准，实际行数少于它时也不至于窄成一条
-# 额度百分比变化很慢，而 /api/oauth/usage 有速率限制 —— 60 秒轮询纯属自伤。
-REFRESH_SEC = 300
+# 30 秒。/api/oauth/usage 有速率限制且限额未公开：实测 12 次/小时长期无事，
+# 而几秒内连发数次会撞 429。30 秒 = 120 次/小时，落在两者之间、未经验证。
+#
+# 敢这么定的依据是退避本身就是限流器：撞 429 后 90 秒起步指数退避、期间零请求，
+# 所以最坏情况是"成功-撞墙-退避"震荡，有效速率会被自动压回去，不会持续超速。
+# 如果你发现窗口经常挂着 ⟳，就是这里太激进了，往回调。
+REFRESH_SEC = 30
 RADIUS = 10
 
 
@@ -114,7 +119,10 @@ class QuotaWidget(QWidget):
         if self.height() != want_h:
             self.resize(W, want_h)
         self.update()
-        # 退避中就掐着退避到期的点重试，别白等一整个刷新周期
+        # 取 min 是为了"退避比刷新间隔长时也别白等一整个周期"。当前 30s 间隔
+        # 短于 90s 起步退避，所以实际总是取 REFRESH_SEC —— 退避期间照常 tick，
+        # read_claude 会短路（零请求），read_codex 照读，Codex 那几行不被拖累。
+        # 间隔若调回大于退避的值，这个 min 就重新生效。
         wait = sources.backoff_remaining()
         self.timer.start(int((min(REFRESH_SEC, wait + 5) if wait else REFRESH_SEC) * 1000))
 
