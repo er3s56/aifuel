@@ -10,7 +10,7 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import QObject, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 
@@ -29,12 +29,7 @@ X_LABEL, X_PCT = 42, 150
 BAR_X0, BAR_X1, BAR_H = 158, 204, 6
 X_RESET_END = W - PAD_X
 MIN_ROWS = 4                    # 高度基准，实际行数少于它时也不至于窄成一条
-# 30 秒。/api/oauth/usage 有速率限制且限额未公开：实测 12 次/小时长期无事，
-# 而几秒内连发数次会撞 429。30 秒 = 120 次/小时，落在两者之间、未经验证。
-#
-# 敢这么定的依据是退避本身就是限流器：撞 429 后 90 秒起步指数退避、期间零请求，
-# 所以最坏情况是"成功-撞墙-退避"震荡，有效速率会被自动压回去，不会持续超速。
-# 如果你发现窗口经常挂着 ⟳，就是这里太激进了，往回调。
+# 正常轮询间隔。失败后的独立退避由数据层控制，手动刷新也不能绕过。
 REFRESH_SEC = 30
 RADIUS = 10
 
@@ -45,13 +40,14 @@ def _qc(hexstr: str, alpha: int = 255) -> QColor:
     return c
 
 
-class Fetcher(QObject):
+class Fetcher(QThread):
     """在子线程里跑网络请求，用信号把结果送回主线程。"""
     done = Signal(list)
+    updated = Signal(list)
 
     def run(self) -> None:
         try:
-            self.done.emit(sources.read_all())
+            self.done.emit(sources.read_all(on_result=self.updated.emit))
         except Exception:
             self.done.emit([])
 
@@ -76,7 +72,12 @@ class QuotaWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.refresh)
+        self.display_timer = QTimer(self)
+        self.display_timer.timeout.connect(self._update_display)
+        self.display_timer.start(1000)
         self._thread = None
+        self._closing = False
+        QApplication.instance().aboutToQuit.connect(self._wait_for_fetch)
         self.refresh()
 
     # ------------------------------------------------ 配置
@@ -98,17 +99,52 @@ class QuotaWidget(QWidget):
     # ------------------------------------------------ 取数
 
     def refresh(self) -> None:
-        if self._thread is not None and self._thread.isRunning():
+        if self._closing or self._thread is not None:
             return                                   # 上一轮还没回来，跳过
-        self._thread = QThread(self)
-        self._worker = Fetcher()
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.done.connect(self._apply)
-        self._worker.done.connect(self._thread.quit)
+        self.timer.stop()
+        self._thread = Fetcher(self)
+        self._thread.updated.connect(self._apply_partial)
+        self._thread.done.connect(self._apply)
+        self._thread.finished.connect(self._fetch_finished)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def _apply(self, data: list) -> None:
+    def _fetch_finished(self) -> None:
+        self._thread = None
+        if self._closing:
+            self.close()
+
+    def _wait_for_fetch(self) -> None:
+        # app.quit / 系统退出也可能绕过 closeEvent。run 不依赖 GUI 事件循环，
+        # 等待它完成后才能销毁窗口及其子线程，不能强杀正在执行的网络请求。
+        self._closing = True
+        self.timer.stop()
+        self.display_timer.stop()
+        if self._thread is not None:
+            self._thread.wait()
+
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        self.timer.stop()
+        self.display_timer.stop()
+        if self._thread is not None:
+            self.hide()
+            event.ignore()             # 取数结束后由 _fetch_finished 再次关闭
+        else:
+            event.accept()
+            QApplication.quit()
+
+    def _apply_partial(self, data: list) -> None:
+        self._apply(display.merge_readings(self.readings, data), schedule=False)
+
+    def _update_display(self) -> None:
+        if not self._closing:
+            self.setToolTip(display.details(self.readings))
+            self.update()
+
+    def _apply(self, data: list, schedule=True) -> None:
+        if self._closing:
+            return
         if data:
             self.readings = data
         self.loading = False
@@ -118,13 +154,10 @@ class QuotaWidget(QWidget):
         want_h = TOP * 2 + rows * ROW_H
         if self.height() != want_h:
             self.resize(W, want_h)
-        self.update()
-        # 取 min 是为了"退避比刷新间隔长时也别白等一整个周期"。当前 30s 间隔
-        # 短于 90s 起步退避，所以实际总是取 REFRESH_SEC —— 退避期间照常 tick，
-        # read_claude 会短路（零请求），read_codex 照读，Codex 那几行不被拖累。
-        # 间隔若调回大于退避的值，这个 min 就重新生效。
-        wait = sources.backoff_remaining()
-        self.timer.start(int((min(REFRESH_SEC, wait + 5) if wait else REFRESH_SEC) * 1000))
+        self._update_display()
+        if schedule:
+            wait = sources.backoff_remaining()
+            self.timer.start(int((min(REFRESH_SEC, wait + .1) if wait else REFRESH_SEC) * 1000))
 
     # ------------------------------------------------ 交互
 
@@ -150,6 +183,9 @@ class QuotaWidget(QWidget):
         act = QAction("立即刷新", self)
         act.triggered.connect(self.refresh)
         m.addAction(act)
+        detail_action = m.addAction("额度详情（百分比为已用）")
+        detail_action.triggered.connect(lambda: QMessageBox.information(
+            self, "额度详情", display.details(self.readings)))
         sub = m.addMenu("不透明度")
         for a in (1.0, 0.94, 0.8, 0.6):
             act = QAction("%d%%" % (a * 100), self)
@@ -164,7 +200,7 @@ class QuotaWidget(QWidget):
 
         m.addSeparator()
         act = QAction("退出", self)
-        act.triggered.connect(QApplication.quit)
+        act.triggered.connect(self.close)
         m.addAction(act)
         m.exec(e.globalPos())
 
@@ -237,8 +273,8 @@ class QuotaWidget(QWidget):
 
             p.setPen(_qc(res.color, 150 if res.dim else 255))
             p.setFont(mono_b)
-            if r.text is not None:                  # 非百分比的值（余额等）
-                val = r.text
+            if res.text is not None:
+                val = res.text
             else:
                 val = "--" if res.percent is None else "%d%%" % round(res.percent)
             p.drawText(QRectF(x_label + (x_pct - x_label) * 0.5, y,
@@ -259,7 +295,7 @@ class QuotaWidget(QWidget):
                                             bar_h / 2, bar_h / 2)
                         p.fillPath(fill, _qc(res.color, 150 if res.dim else 255))
 
-            reset_txt = display.fmt_reset(r.resets_at)
+            reset_txt = display.status_text(r)
             if reset_txt:
                 p.setPen(_qc(display.FG_DIM))
                 p.setFont(small_cjk if any(ord(c) > 127 for c in reset_txt) else small)
@@ -268,6 +304,15 @@ class QuotaWidget(QWidget):
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--diagnose-codex":
+        # 离线缓存必须能和实时成功区分；供用户排查、也供打包后的连通性验证。
+        from dataclasses import asdict
+        readings = sources.read_codex()
+        report = os.path.join(sources.data_dir(), "codex-report.json")
+        with open(report, "w", encoding="utf-8") as f:
+            json.dump([asdict(r) for r in readings], f, ensure_ascii=False, indent=2)
+        sys.exit(0 if readings and all(not r.stale and not r.error for r in readings) else 1)
+
     # 诊断入口：不开窗口，直接查/改开机自启。GUI 里点菜单不便于自动化验证，
     # 而"打包后还能不能正常建快捷方式"必须在真实的冻结进程里测过才算数。
     if len(sys.argv) > 1 and sys.argv[1] == "--autostart":

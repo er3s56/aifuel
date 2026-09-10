@@ -3,7 +3,7 @@
 # onedir 而非 onefile：onefile 每次启动都要把 Qt 的一堆 DLL 解压到临时目录，
 # 冷启动要好几秒；而且自解压行为更容易被杀软误报。
 
-param([switch]$Debug)   # -Debug 打出带控制台的版本，能看见崩溃回溯
+param([switch]$Debug, [string]$DistPath = "dist")   # -Debug 打出带控制台的版本
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -41,6 +41,7 @@ $mode = if ($Debug) { "--console" } else { "--windowed" }
 $args = @(
   "--noconfirm", "--clean", $mode, "--onedir",
   "--name", $name,
+  "--distpath", $DistPath,
   "--icon", "aifuel.ico",
   "--log-level", "WARN"
 )
@@ -48,11 +49,27 @@ foreach ($e in $excludes) { $args += @("--exclude-module", $e) }
 $args += "widget_qt.py"
 
 Write-Output "开始构建…"
-& $py -m PyInstaller @args
-if ($LASTEXITCODE -ne 0) { Write-Output "构建失败 (exit $LASTEXITCODE)"; exit 1 }
+# PyInstaller 会沿 PATH 查 DLL。Poppler 等工具的 icuuc.dll 与 Windows 同名，
+# 但导出符号不同，误打进去会让 QtCore 在 exe 中无法加载。构建时只保留
+# 当前 Python 和 Windows 目录；包自身的 DLL 由 PyInstaller 的 hook 收集。
+$pythonExe = & $py -c "import sys; print(sys.executable)"
+if ($LASTEXITCODE -ne 0) { Write-Output "无法定位 Python 解释器"; exit 1 }
+$savedBuildPath = $env:PATH
+try {
+    $env:PATH = @(
+        (Split-Path -Parent $pythonExe),
+        (Join-Path $env:WINDIR "System32"),
+        $env:WINDIR
+    ) -join ";"
+    & $py -m PyInstaller @args
+    $buildExitCode = $LASTEXITCODE
+} finally {
+    $env:PATH = $savedBuildPath
+}
+if ($buildExitCode -ne 0) { Write-Output "构建失败 (exit $buildExitCode)"; exit 1 }
 
-$exe = "dist\$name\$name.exe"
+$exe = Join-Path $DistPath "$name\$name.exe"
 if (-not (Test-Path $exe)) { Write-Output "没产出 exe"; exit 1 }
-$total = (Get-ChildItem "dist\$name" -Recurse -File | Measure-Object -Property Length -Sum).Sum
+$total = (Get-ChildItem (Join-Path $DistPath $name) -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output ("完成: $exe")
 Write-Output ("整个文件夹 {0:N1} MB" -f ($total / 1MB))

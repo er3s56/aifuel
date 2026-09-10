@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import tkinter as tk
 from tkinter import messagebox
@@ -25,7 +26,7 @@ X_TAG, X_LABEL, X_PCT = 9, 42, 146
 BAR_X0, BAR_X1, BAR_H = 154, 200, 5
 X_RESET = W - 9
 MIN_ROWS = 4                      # 高度基准，行数少时也不至于窄成一条
-# 30 秒。理由与取舍见 widget_qt.py 里同名常量的注释（退避充当限流器）。
+# 正常轮询间隔；失败退避由共用数据层控制。
 REFRESH_SEC = 30
 
 
@@ -72,7 +73,14 @@ class QuotaWidget:
 
         self.readings: list = []
         self.loading = True
-        self.draw()
+        self._closed = False
+        self._fetching = False
+        self._refresh_after_id = None
+        self._poll_after_id = None
+        self._display_after_id = None
+        self._results = queue.SimpleQueue()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._display_tick()
         self.refresh()
 
     # ------------------------------------------------ 拖动 / 菜单
@@ -91,6 +99,8 @@ class QuotaWidget:
     def _menu(self, e):
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label="立即刷新", command=self.refresh)
+        m.add_command(label="额度详情（百分比为已用）", command=lambda: messagebox.showinfo(
+            "额度详情", display.details(self.readings), parent=self.root))
         sub = tk.Menu(m, tearoff=0)
         for a in (1.0, 0.9, 0.75, 0.6):
             sub.add_command(label="%d%%" % (a * 100), command=lambda v=a: self._alpha(v))
@@ -102,12 +112,12 @@ class QuotaWidget:
                           command=self._toggle_autostart)
 
         m.add_separator()
-        m.add_command(label="退出", command=self.root.destroy)
+        m.add_command(label="退出", command=self.close)
         m.tk_popup(e.x_root, e.y_root)
 
     def _toggle_autostart(self) -> None:
         want = self._auto_var.get()
-        ok, msg = autostart.enable() if want else autostart.disable()
+        ok, msg = autostart.enable("tk") if want else autostart.disable()
         if not ok:
             # 失败必须告诉用户 —— 静默失败会让人以为设好了，开机才发现没有
             messagebox.showwarning("开机自启", msg, parent=self.root)
@@ -121,23 +131,61 @@ class QuotaWidget:
     # ------------------------------------------------ 取数
 
     def refresh(self) -> None:
+        if self._closed or self._fetching:
+            return
+        if self._refresh_after_id is not None:
+            self.root.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
+        self._fetching = True
         threading.Thread(target=self._fetch, daemon=True).start()
+        self._poll_after_id = self.root.after(50, self._poll_result)
 
     def _fetch(self) -> None:
         try:
-            data = sources.read_all()
+            data = sources.read_all(on_result=lambda partial: self._results.put((False, partial)))
         except Exception:
             data = []
-        # 网络在子线程，回主线程画 —— tkinter 不是线程安全的
-        self.root.after(0, self._apply, data)
+        # 子线程只写队列；窗口已退出时也不会再调用 Tcl/Tk。
+        self._results.put((True, data))
 
-    def _apply(self, data: list) -> None:
+    def _poll_result(self) -> None:
+        self._poll_after_id = None
+        if self._closed:
+            return
+        while True:
+            try:
+                complete, data = self._results.get_nowait()
+            except queue.Empty:
+                self._poll_after_id = self.root.after(50, self._poll_result)
+                return
+            if complete:
+                self._fetching = False
+                self._apply(data)
+                return
+            self._apply(display.merge_readings(self.readings, data), schedule=False)
+
+    def _display_tick(self) -> None:
+        if not self._closed:
+            self.draw()
+            self._display_after_id = self.root.after(1000, self._display_tick)
+
+    def _apply(self, data: list, schedule=True) -> None:
         self.readings, self.loading = data, False
         self.draw()
-        # 取 min 的用意见 widget_qt.py 同处注释（当前 30s 间隔下总是取 REFRESH_SEC）
-        wait = sources.backoff_remaining()
-        delay = min(REFRESH_SEC, wait + 5) if wait else REFRESH_SEC
-        self.root.after(int(delay * 1000), self.refresh)
+        if schedule:
+            wait = sources.backoff_remaining()
+            delay = min(REFRESH_SEC, wait + .1) if wait else REFRESH_SEC
+            self._refresh_after_id = self.root.after(int(delay * 1000), self.refresh)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for timer_id in (self._refresh_after_id, self._poll_after_id, self._display_after_id):
+            if timer_id is not None:
+                self.root.after_cancel(timer_id)
+        self._refresh_after_id = self._poll_after_id = self._display_after_id = None
+        self.root.destroy()
 
     # ------------------------------------------------ 绘制
 
@@ -174,8 +222,8 @@ class QuotaWidget:
             c.create_text(X_LABEL, y, text=r.label, anchor="w", fill=display.FG_DIM,
                           font=cjk if has_cjk else ("Consolas", 8))
 
-            if r.text is not None:                   # 非百分比的值（余额等）
-                val = r.text
+            if res.text is not None:
+                val = res.text
             else:
                 val = "--" if res.percent is None else "%d%%" % round(res.percent)
             c.create_text(X_PCT, y, text=val + res.note, anchor="e",
@@ -190,7 +238,7 @@ class QuotaWidget:
                         c.create_rectangle(BAR_X0, y - BAR_H // 2, BAR_X0 + w,
                                            y + BAR_H // 2 + 1, fill=color, width=0)
 
-            reset_txt = display.fmt_reset(r.resets_at)
+            reset_txt = display.status_text(r)
             if reset_txt:
                 c.create_text(X_RESET, y, text=reset_txt, anchor="e", fill=display.FG_DIM,
                               font=cjk if any(ord(ch) > 127 for ch in reset_txt)
@@ -205,4 +253,3 @@ if __name__ == "__main__":
     if not sources.acquire_single_instance():
         sys.exit(0)                 # 已经有一份在跑，静默退出
     QuotaWidget().run()
-

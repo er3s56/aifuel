@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""额度数据层：Claude(OAuth API) + ChatGPT/Codex(本地会话日志)。
+"""额度数据层：Claude(OAuth API) + ChatGPT/Codex(账户实时查询)。
 
 设计约束：
   * 对 ~/.claude/.credentials.json 只读，永不写入 —— 避免与 Claude Code
@@ -8,19 +8,26 @@
 """
 from __future__ import annotations
 
+import atexit
+import hashlib
 import json
+import math
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
+from codex_live import CodexClient
+from quota_policy import QueryError, RetryState, retry_after_seconds
+
 HOME = os.path.expanduser("~")
 CLAUDE_CREDS = os.path.join(HOME, ".claude", ".credentials.json")
-CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 
 
 def data_dir() -> str:
@@ -40,18 +47,16 @@ def data_dir() -> str:
 
 CACHE_FILE = os.path.join(data_dir(), "cache.json")
 
-# 429 退避：/api/oauth/usage 自己有速率限制，撞上了就别再猛敲。
-# 起步必须明显短于刷新间隔，否则退避窗口和刷新周期同步，每次刷新都空转一轮，
-# 恢复要拖十几分钟——用户看到的就是"一直 ⟳，像是坏了"。
-BACKOFF_FIRST = 90.0
-BACKOFF_MAX = 900.0
-_backoff_until = 0.0
-_backoff_step = 0.0
+_cache_lock = threading.RLock()
+_memory_samples = {}
+_retry_states = {name: RetryState() for name in ("claude", "chatgpt")}
+_provider_locks = {name: threading.Lock() for name in _retry_states}
 
 
 def backoff_remaining() -> float:
-    """还要退避多少秒；0 表示现在就能发请求。前端据此安排下次刷新。"""
-    return max(0.0, _backoff_until - time.time())
+    """离最近一次重试还有几秒；两家的等待互不影响。"""
+    waits = [state.retry_at - time.time() for state in _retry_states.values()]
+    return min((wait for wait in waits if wait > 0), default=0.0)
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -69,6 +74,11 @@ class Reading:
     stale: bool = False                 # True = 缓存值，非实时
     error: Optional[str] = None
     text: Optional[str] = None          # 非百分比的值（如余额），有则替代百分比显示
+    observed_at: Optional[float] = None # 数据采样时间，不是读取缓存的时间
+    source: str = ""                    # "api" | "log"
+    detail: Optional[str] = None        # 缓存降级原因，保留百分比显示
+    failure_kind: str = ""              # temporary | rate_limit | auth | invalid | setup
+    retry_at: Optional[float] = None    # 下次允许尝试的时间；手动刷新同样遵守
 
     def reset_in(self) -> Optional[float]:
         """距离重置还有多少秒；None 表示未知。"""
@@ -82,37 +92,128 @@ class Reading:
 def _load_cache() -> dict:
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
 def _save_cache(key: str, readings: "list[Reading]") -> None:
-    data = _load_cache()
-    data[key] = {"at": time.time(), "readings": [asdict(r) for r in readings]}
-    tmp = CACHE_FILE + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, CACHE_FILE)          # 原子替换，避免半截文件
-    except Exception:
-        pass
+    # 两家并行完成时，读改写必须一起加锁，否则后写者会丢掉另一家的结果。
+    with _cache_lock:
+        data = _load_cache()
+        data[key] = {"at": time.time(), "readings": [asdict(r) for r in readings]}
+        # 磁盘写入失败时也保留这次成功值；保存快照，避免前端或降级标记改写原始时间。
+        _memory_samples[(CACHE_FILE, key)] = data[key]
+        tmp = CACHE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, CACHE_FILE)
+        except Exception:
+            pass
 
 
 def _from_cache(key: str) -> "list[Reading]":
-    entry = _load_cache().get(key)
-    if not entry:
+    entry = _memory_samples.get((CACHE_FILE, key)) or _load_cache().get(key)
+    if not isinstance(entry, dict) or not isinstance(entry.get("readings"), list):
         return []
     out = []
     for d in entry.get("readings", []):
+        if not isinstance(d, dict):
+            continue
         d = dict(d)
         d.pop("stale", None)
         d.pop("error", None)
         try:
-            out.append(Reading(stale=True, **d))
-        except TypeError:
+            reading = Reading(stale=True, **d)
+            if reading.provider != key:
+                continue
+            _validate_readings([reading])
+            out.append(reading)
+        except (TypeError, ValueError):
             pass                              # 缓存是旧版本结构，丢弃
     return out
+
+
+def _credential_stamp(provider):
+    path = CLAUDE_CREDS if provider == "claude" else os.path.join(
+        os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "auth.json")
+    try:
+        with open(path, "rb") as stream:
+            return hashlib.sha256(stream.read()).digest()
+    except OSError:
+        return None
+
+
+def _validate_readings(readings):
+    if not readings:
+        raise ValueError("missing limits")
+    for reading in readings:
+        if not isinstance(reading.label, str) or not reading.label:
+            raise ValueError("invalid label")
+        if reading.percent is None and reading.text is None:
+            raise ValueError("missing value")
+        if reading.percent is not None and (
+                isinstance(reading.percent, bool) or not isinstance(reading.percent, (int, float))
+                or not math.isfinite(reading.percent) or reading.percent < 0):
+            raise ValueError("invalid percentage")
+        for value in (reading.observed_at, reading.resets_at):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or not 0 <= value <= 253402214400):
+                raise ValueError("invalid timestamp")
+        if reading.text is not None and not isinstance(reading.text, str):
+            raise ValueError("invalid balance")
+
+
+def _fallback(provider, state):
+    # 主面板仅接受明确来自账户接口的缓存。旧版日志或来源不明的缓存一律忽略。
+    readings = [r for r in _from_cache(provider) if r.source == "api"]
+    if not readings:
+        readings = [Reading(provider, "状态", None, stale=True, error=state.detail)]
+    for reading in readings:
+        reading.stale = True
+        reading.detail = state.detail
+        reading.failure_kind = state.kind
+        reading.retry_at = state.retry_at
+    return readings
+
+
+def _query_provider(provider, fetch, timeout):
+    with _provider_locks[provider]:
+        state = _retry_states[provider]
+        stamp = _credential_stamp(provider)
+        # 凭证变化可提前结束登录等待，但不能绕过接口限流。
+        if state.kind == "auth" and stamp != state.credential_stamp:
+            state.clear()
+            if provider == "chatgpt" and _codex_client is not None:
+                _codex_client.close()
+        if time.time() < state.retry_at:
+            return _fallback(provider, state)
+        try:
+            readings = fetch(timeout)
+            _validate_readings(readings)
+        except Exception as exc:
+            if isinstance(exc, QueryError):
+                error = exc
+            elif isinstance(exc, (TimeoutError, urllib.error.URLError)):
+                error = QueryError("额度查询超时" if isinstance(exc, TimeoutError) else "网络连接失败")
+            elif isinstance(exc, FileNotFoundError):
+                error = QueryError("找不到 Codex CLI，请安装并登录，或检查 AIFUEL_CODEX_EXE", "setup")
+            elif isinstance(exc, (ValueError, TypeError, KeyError, AttributeError, OverflowError)):
+                error = QueryError("额度响应格式异常或缺少有效额度字段", "invalid")
+            else:
+                error = QueryError("账户额度查询失败，请检查网络后重试")
+            state.fail(error, stamp, time.time())
+            return _fallback(provider, state)
+        state.clear()
+        now = time.time()
+        for reading in readings:
+            reading.observed_at, reading.source = now, "api"
+            reading.stale, reading.error, reading.detail = False, None, None
+            reading.failure_kind, reading.retry_at = "", None
+        _save_cache(provider, readings)
+        return readings
 
 
 # ---------------------------------------------------------------- Claude
@@ -127,33 +228,24 @@ def _iso_to_epoch(s: Optional[str]) -> Optional[float]:
 
 
 def read_claude(timeout: float = 12.0) -> "list[Reading]":
-    global _backoff_until, _backoff_step
+    return _query_provider("claude", _fetch_claude, timeout)
 
-    if time.time() < _backoff_until:
-        # 还在退避窗口里，直接吃缓存，一个请求都不发
-        cached = _from_cache("claude")
-        if cached:
-            return cached
-        left = int(_backoff_until - time.time())
-        return [Reading("claude", "5h", None, error="接口限流中，%ds 后重试" % left)]
 
+def _fetch_claude(timeout):
     try:
         with open(CLAUDE_CREDS, encoding="utf-8") as f:
             oauth = json.load(f)["claudeAiOauth"]
-    except Exception as e:
-        return _from_cache("claude") or [
-            Reading("claude", "5h", None, error="读不到凭证: %s" % type(e).__name__)
-        ]
-
-    if time.time() >= oauth.get("expiresAt", 0) / 1000:
-        # 过期 —— 不自己刷新（会轮换 refresh token，可能把你登出）
-        cached = _from_cache("claude")
-        if cached:
-            return cached
-        return [Reading("claude", "5h", None, error="token 过期，用一次 Claude Code 即可")]
+        token = oauth["accessToken"]
+        expiry = float(oauth["expiresAt"]) / 1000
+        if not isinstance(token, str) or not token or not math.isfinite(expiry):
+            raise ValueError("invalid credentials")
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        raise QueryError("无法读取有效登录凭证，请登录 Claude Code", "auth") from None
+    if time.time() >= expiry:
+        raise QueryError("Claude 登录已过期，请打开 Claude Code 更新登录", "auth")
 
     req = urllib.request.Request(USAGE_URL, headers={
-        "Authorization": "Bearer %s" % oauth["accessToken"],
+        "Authorization": "Bearer %s" % token,
         "anthropic-beta": OAUTH_BETA,
         "User-Agent": UA,
         "Accept": "application/json",
@@ -162,20 +254,17 @@ def read_claude(timeout: float = 12.0) -> "list[Reading]":
         with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.load(r)
     except urllib.error.HTTPError as e:
+        retry_after = retry_after_seconds(e.headers.get("Retry-After")) if e.headers else None
+        e.close()
         if e.code == 429:
-            _backoff_step = min(BACKOFF_MAX, _backoff_step * 2 if _backoff_step else BACKOFF_FIRST)
-            _backoff_until = time.time() + _backoff_step
-        return _from_cache("claude") or [Reading("claude", "5h", None, error="HTTP %s" % e.code)]
-    except Exception as e:
-        return _from_cache("claude") or [Reading("claude", "5h", None, error=type(e).__name__)]
-
-    _backoff_step = 0.0            # 成功一次就把退避清零
-    _backoff_until = 0.0
-
-    readings = _parse_claude_limits(payload)
-    if readings:
-        _save_cache("claude", readings)
-    return readings or [Reading("claude", "5h", None, error="返回里没有额度字段")]
+            raise QueryError("额度接口限流，等待后自动重试", "rate_limit",
+                             retry_after) from None
+        if e.code == 401:
+            raise QueryError("Claude 登录已失效，请重新登录 Claude Code", "auth") from None
+        if e.code == 403:
+            raise QueryError("额度接口拒绝访问，请检查账户权限", "setup") from None
+        raise QueryError("额度接口返回 HTTP %s" % e.code) from None
+    return _parse_claude_limits(payload)
 
 
 # 已知 kind 的短标签。不在表里的 kind 不会被丢掉，会用 kind 名本身当标签 ——
@@ -206,6 +295,8 @@ def _parse_claude_limits(payload: dict) -> "list[Reading]":
     for item in payload.get("limits") or []:
         if not isinstance(item, dict) or item.get("percent") is None:
             continue
+        if isinstance(item["percent"], bool):
+            raise ValueError("invalid percentage")
         label = _claude_label(item)
         key = (label, item.get("kind"))
         if key in seen:
@@ -224,6 +315,8 @@ def _parse_claude_limits(payload: dict) -> "list[Reading]":
     for top_key, label in (("five_hour", "5h"), ("seven_day", "wk")):
         blk = payload.get(top_key)
         if isinstance(blk, dict) and blk.get("utilization") is not None:
+            if isinstance(blk["utilization"], bool):
+                raise ValueError("invalid percentage")
             out.append(Reading(
                 "claude", label, float(blk["utilization"]),
                 _iso_to_epoch(blk.get("resets_at")),
@@ -233,24 +326,14 @@ def _parse_claude_limits(payload: dict) -> "list[Reading]":
 
 # ---------------------------------------------------------------- Codex
 
-def _tail(path: str, nbytes: int = 512 * 1024) -> str:
-    """只读文件尾部——会话 jsonl 可能几十 MB，全读太慢。"""
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        f.seek(max(0, size - nbytes))
-        return f.read().decode("utf-8", "replace")
-
-
 # 键名 primary/secondary 只是位置，不代表窗口长度 —— 换套餐会变。
 # 实测 prolite 计划的 primary 是 10080 分钟（周窗），secondary 为 null；
 # 而 plus 计划的 primary 是 300 分钟（5 小时窗）。所以标签必须由
-# window_minutes 推出来，按键名硬编码会把周额度标成 5h。
+# windowDurationMins 推出来，按键名硬编码会把周额度标成 5h。
 _CODEX_FALLBACK_LABELS = {"primary": "主", "secondary": "次"}
 
 
-def _window_label(blk: dict, key: str) -> str:
-    wm = blk.get("window_minutes")
+def _window_label(wm: Optional[float], key: str) -> str:
     if isinstance(wm, (int, float)) and wm > 0:
         wm = int(wm)
         if wm >= 10080 and wm % 10080 == 0:
@@ -264,74 +347,79 @@ def _window_label(blk: dict, key: str) -> str:
     return _CODEX_FALLBACK_LABELS.get(key, key.replace("_", " ")[:8])
 
 
-def _parse_codex_limits(rl: dict) -> "list[Reading]":
+_codex_client = None
+
+
+def _fetch_codex_live(timeout: float) -> dict:
+    global _codex_client
+    if _codex_client is None:
+        _codex_client = CodexClient(os.path.join(data_dir(), "codex-rpc"))
+        atexit.register(_codex_client.close)
+    return _codex_client.read_rate_limits(timeout)
+
+
+def _parse_codex_live(payload: dict) -> "list[Reading]":
+    buckets = payload.get("rateLimitsByLimitId")
+    # 主额度必须明确选 codex，不能把 Spark / Reserve 的百分比混进 GPT 主额度。
+    limits = buckets.get("codex") if isinstance(buckets, dict) else None
+    if not isinstance(limits, dict):
+        limits = payload.get("rateLimits")
+    if not isinstance(limits, dict) or limits.get("limitId") not in (None, "codex"):
+        return []
     ranked = []
-    for key, blk in rl.items():
-        if not isinstance(blk, dict) or blk.get("used_percent") is None:
+    for key in ("primary", "secondary"):
+        window = limits.get(key)
+        if not isinstance(window, dict) or window.get("usedPercent") is None or isinstance(window.get("usedPercent"), bool):
             continue
-        wm = blk.get("window_minutes")
-        ranked.append((
-            wm if isinstance(wm, (int, float)) else 1 << 30,
-            Reading("chatgpt", _window_label(blk, key),
-                    float(blk["used_percent"]), blk.get("resets_at")),
-        ))
-    # 短窗口排前面。行序必须稳定，否则每次刷新都会跳
-    ranked.sort(key=lambda t: t[0])
-    out = [r for _, r in ranked]
-
-    # 付费余量：只有真的启用了才占一行，否则一直显示 "余额 0" 是噪音。
-    # 它是绝对值不是百分比，走 text 字段，前端不给它画进度条。
-    credits = rl.get("credits")
-    if isinstance(credits, dict) and credits.get("has_credits"):
-        if credits.get("unlimited"):
-            out.append(Reading("chatgpt", "余额", None, text="∞"))
-        else:
-            bal = credits.get("balance")
-            out.append(Reading("chatgpt", "余额", None, text=str(bal) if bal is not None else "?"))
-    return out
-
-
-def _newest_sessions(limit: int = 8) -> "list[str]":
-    found = []
-    for root, _dirs, files in os.walk(CODEX_SESSIONS):
-        for name in files:
-            if name.endswith(".jsonl"):
-                p = os.path.join(root, name)
-                try:
-                    found.append((os.path.getmtime(p), p))
-                except OSError:
-                    pass
-    found.sort(reverse=True)
-    return [p for _, p in found[:limit]]
-
-
-def read_codex() -> "list[Reading]":
-    for path in _newest_sessions():
         try:
-            chunk = _tail(path)
-        except Exception:
+            percent = float(window["usedPercent"])
+            if not math.isfinite(percent):
+                continue
+            reset = window.get("resetsAt")
+            if reset is not None:
+                reset = float(reset)
+                if not math.isfinite(reset):
+                    continue
+            minutes = window.get("windowDurationMins")
+            if not isinstance(minutes, (int, float)) or not math.isfinite(minutes):
+                minutes = None
+        except (TypeError, ValueError, OverflowError):
             continue
-        # 从后往前找最后一条带 rate_limits 的记录
-        for line in reversed(chunk.splitlines()):
-            if '"rate_limits"' not in line:
-                continue
+        ranked.append((minutes if minutes is not None else float("inf"),
+                       Reading("chatgpt", _window_label(minutes, key), percent, reset)))
+    # 短窗口排前面；直接解析账户响应，不再转换为旧日志字段。
+    ranked.sort(key=lambda item: item[0])
+    readings = [reading for _, reading in ranked]
+    credits = limits.get("credits")
+    if isinstance(credits, dict) and credits.get("hasCredits"):
+        balance = credits.get("balance")
+        text = "∞" if credits.get("unlimited") else (str(balance) if balance is not None else "?")
+        readings.append(Reading("chatgpt", "余额", None, text=text))
+    return readings
+
+
+def read_codex(timeout: float = 15.0) -> "list[Reading]":
+    return _query_provider("chatgpt", lambda wait: _parse_codex_live(_fetch_codex_live(wait)), timeout)
+
+
+def read_all(on_result=None) -> "list[Reading]":
+    """并行查询；完成一家立即通知前端，最终列表仍保持 Claude、GPT 的顺序。"""
+    results = {}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="quota") as pool:
+        pending = {pool.submit(read): provider for provider, read in (
+            ("claude", read_claude), ("chatgpt", read_codex))}
+        for future in as_completed(pending):
+            provider = pending[future]
             try:
-                rec = json.loads(line)
+                data = future.result()
             except Exception:
-                continue          # 尾部截断的半行，跳过
-            rl = (rec.get("payload") or {}).get("rate_limits")
-            if not isinstance(rl, dict):
-                continue
-            readings = _parse_codex_limits(rl)
-            if readings:
-                _save_cache("chatgpt", readings)
-                return readings
-    cached = _from_cache("chatgpt")
-    return cached or [Reading("chatgpt", "5h", None, error="没找到 Codex 会话记录")]
-
-
-def read_all() -> "list[Reading]":
-    return read_claude() + read_codex()
+                state = _retry_states[provider]
+                state.fail(QueryError("账户额度查询失败"), _credential_stamp(provider), time.time())
+                data = _fallback(provider, state)
+            results[provider] = data
+            if on_result is not None:
+                on_result(data)
+    return [reading for provider in ("claude", "chatgpt") for reading in results[provider]]
 
 
 # ---------------------------------------------------------------- 单实例

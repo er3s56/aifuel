@@ -31,19 +31,17 @@ def _here() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def target() -> "tuple[str, str]":
+def target(frontend: str = "qt") -> "tuple[str, str]":
     """返回 (要启动的东西, 工作目录)。
 
-    打包成 exe 时就指向自己；源码运行时指向 .vbs 启动器，因为直接跑
-    widget_qt.py 会弹控制台窗口。
+    打包成 exe 时就指向自己；源码运行时指向当前前端的 .vbs 启动器。
     """
     here = _here()
     if getattr(sys, "frozen", False):
         return os.path.abspath(sys.executable), here
-    vbs = os.path.join(here, "run_qt.vbs")
-    if os.path.isfile(vbs):
-        return vbs, here
-    return os.path.join(here, "widget_qt.py"), here
+    if frontend not in ("qt", "tk"):
+        raise ValueError("未知前端: %s" % frontend)
+    return os.path.join(here, "run_%s.vbs" % frontend), here
 
 
 def is_enabled() -> bool:
@@ -63,8 +61,8 @@ def _make_shortcut(link: str, tgt: str, workdir: str, icon: str = "") -> None:
     没被真正测过。切换自启是个罕见的用户动作，多花一秒无所谓。
     PowerShell 在 Win10/11 上一定存在。
     """
-    if tgt.lower().endswith((".vbs", ".py")):
-        # 脚本不能直接当快捷方式目标，要用 wscript 拉起（且不弹控制台）
+    if tgt.lower().endswith(".vbs"):
+        # VBS 用 wscript 拉起（且不弹控制台）；Python 脚本不能交给 wscript。
         ps_target = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
                                  "System32", "wscript.exe")
         ps_args = '"%s"' % tgt
@@ -86,14 +84,13 @@ def _make_shortcut(link: str, tgt: str, workdir: str, icon: str = "") -> None:
     )
 
 
-def enable() -> "tuple[bool, str]":
+def enable(frontend: str = "qt") -> "tuple[bool, str]":
     """开启自启。返回 (成功?, 给用户看的说明)。"""
     if sys.platform != "win32":
         return False, "只支持 Windows"
-    tgt, workdir = target()
+    tgt, workdir = target(frontend)
     if not os.path.exists(tgt):
-        # dist\ 是 gitignore 的：新克隆还没 build 时这里就是空的
-        return False, "找不到启动目标：\n%s\n先运行 build.ps1 打包。" % tgt
+        return False, "找不到启动目标：\n%s\n请保留对应的 VBS 启动器，或重新打包 exe。" % tgt
     try:
         os.makedirs(startup_dir(), exist_ok=True)
         icon = os.path.join(_here(), "aifuel.ico")
