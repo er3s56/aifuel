@@ -40,9 +40,11 @@ class ReservationTests(unittest.TestCase):
         c._running_executable.return_value = c.directory / "version/windhawk.exe"
         with patch("taskbar_reservation.subprocess.run") as run:
             c.close()
+            c.close()  # closeEvent and aboutToQuit may both request cleanup.
             run.assert_called_once()
         c.request(100, 400)
         c.api.SetPropW.assert_not_called()
+        c = self.client(Path("private-runtime").resolve())
         c._running_executable.return_value = Path("another-install/windhawk.exe").resolve()
         with patch("taskbar_reservation.subprocess.run") as run:
             c.close()

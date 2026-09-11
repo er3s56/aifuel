@@ -18,6 +18,7 @@ Claude 的额度类型不做白名单；GPT 显示 Codex 主额度及启用的�
 
 | 方式 | 需要什么 | 说明 |
 |---|---|---|
+| **`AI-Fuel-版本-windows-x64-setup.exe`** | Windows x64；无需 Python | 安装向导，开始菜单入口、可选桌面快捷方式，支持系统卸载 |
 | **`dist\aifuel\aifuel.exe`** | 无需 Python；登录要求见下方 | 独立打包，双击即用。整个 `dist\aifuel` 文件夹一起拷走 |
 | `run_qt.vbs` | Python + PySide6 | 开发时用，改完代码直接跑 |
 | `run_tk.vbs` | Python（tkinter 自带） | 零依赖备选，外观朴素些 |
@@ -26,6 +27,10 @@ Claude 的额度类型不做白名单；GPT 显示 Codex 主额度及启用的�
 > 不是你的账号——读不到 `~/.claude` 和 `~/.codex` 就只会显示 `--`。
 > GPT 实时查询还需要可运行的 Codex CLI。默认查找 PATH 和 Windows 安装器目录；
 > 非标准安装可用 `AIFUEL_CODEX_EXE` 指定可执行文件路径。
+
+安装后自动启动时，Windows 的目录链接保护可能让 Codex 启动路径报 448。
+AI Fuel 会读取启动链接并查找当前版本的实际程序文件，保持系统保护开启，
+无需重新登录或手工配置路径。
 
 > **杀软**：未签名的 PyInstaller 产物可能被 Defender / SmartScreen 拦，
 > 需要手动点“仍要运行”。根治要代码签名证书。
@@ -173,6 +178,37 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 
 ## 重新打包
 
+### Windows 安装包
+
+构建机器安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)（已验证 6.7.3）后，
+双击项目根目录的 **`build-installer.cmd`**。窗口会保留构建结果，不需要记住
+PowerShell 命令或永久修改执行策略。Python 和依赖仍需与下方便携版构建环境一致。
+
+产物在 `dist\installer\AI-Fuel-0.1.3-windows-x64-setup.exe`，旁边的 `.sha256`
+文件用于校验。发布时只需分发这个安装包，用户无需 Python、编译器或 PowerShell 操作。
+指定版本可运行 `build-installer.cmd -Version 0.2.0`；自定义编译器位置使用
+`-IsccPath "C:\工具目录\ISCC.exe"`。
+
+安装包默认安装到 `%LOCALAPPDATA%\Programs\AI Fuel`，仅对当前用户生效，无需管理员权限。
+提供开始菜单入口和可选桌面快捷方式；开机自启在程序菜单中控制。升级前需退出正在运行的
+AI Fuel（含便携版）。后续版本保持同一安装标识，覆盖安装即可升级。
+任务栏模式启动时先等待占位初始化，避免先闪出悬浮面板；初始化超过 5 秒仍未就绪时
+才暂用悬浮窗。退出取数期间再次打开会恢复原窗口和请求，避免等待网络超时才重新显示。
+卸载入口在 Windows“已安装的应用”中；卸载保留 `%LOCALAPPDATA%\aifuel` 下的个人配置和缓存，
+只清理指向本次安装路径的开机自启快捷方式。账户登录前提与便携版相同。
+
+安装包构建先在 `build\installer-payload` 生成完整程序，包含任务栏运行时及其对应源码和许可，
+再用 `installer\aifuel.iss` 制作安装向导。简体中文语言文件来自
+[Inno Setup 6.7.3 仓库](https://github.com/jrsoftware/issrc/blob/is-6_7_3/Files/Languages/Unofficial/ChineseSimplified.isl)，
+保留原作者信息。当前安装包未做代码签名，发布签名与现有便携版的要求一致。
+
+构建后可运行 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\smoke_installer.ps1`
+验证真实安装、快捷方式、运行中阻止安装、程序启动、升级和卸载。
+测试使用独立产品标识及 `build` 下的中文安装路径，检查文件哈希、个人数据和原有自启项，
+完成后卸载测试产品，日志保留在 `build\aifuel-smoke-*`。
+
+### 便携版
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
@@ -198,6 +234,8 @@ python -m unittest discover -s tests -v
 测试使用隔离的缓存和模拟请求，不调用额度接口或修改真实开机自启。
 安装 PySide6 后会同时验证 Qt 线程释放和退出；未安装时自动跳过 Qt 测试。
 Windows 上若已有 `dist\aifuel\aifuel.exe`，还会验证打包程序的启动诊断入口。
+Windows 11 上还会在独立测试进程中启用目录链接保护，验证安装后查询组件的
+自动发现；测试使用临时文件，不联网、不改变系统保护设置。
 
 ## 编码约定（改代码前必读）
 

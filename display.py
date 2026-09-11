@@ -129,6 +129,8 @@ def status_text(reading: Reading) -> str:
         return "需授权" if reading.provider == "claude" else "需登录"
     if reading.failure_kind == "rate_limit":
         return "限流等待"
+    if reading.failure_kind == "dependency":
+        return "查询重试"
     if reading.error:
         return "查询失败"
     if window_expired(reading):

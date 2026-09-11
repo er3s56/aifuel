@@ -190,8 +190,8 @@ class WindowsTaskbar:
 
         self.api.EnumChildWindows(bar_hwnd, child, 0)
         dpi = self.api.GetDpiForWindow(bar_hwnd) or 96
-        # 扩展已确认按当前宽度缩小按钮区域，UIA 暂时卡住也不能撤销占位。
-        # 有新鲜按钮边界时仍检查额外控件；未启用扩展时必须等扫描确认。
+        # 扩展只调整应用按钮区域；天气/股票等入口仍需实际边界确认。
+        # 不能把扫描尚未完成当成没有障碍物，否则首次布局会短暂重叠。
         reserved = bool(self._reservation and self._reservation.ready)
         reservation = (self._reservation.hwnd, logical_width) if reserved else None
         blocked = self._button_bounds(bar_hwnd, bar, tray, dpi, occupied_right, reservation)
@@ -201,10 +201,15 @@ class WindowsTaskbar:
         physical_width = int(logical_width * dpi / 96 + .5)
         result = arrange(bar, tray, monitor, boundary,
                          physical_width, dpi, blocked or ())
-        if result.state == "docked" and blocked is None and not reserved:
-            result = Placement("fallback", reason="暂未确认任务栏空闲区域，暂以悬浮窗显示")
+        if result.state == "docked" and blocked is None:
+            result = Placement("pending" if self._reservation else "fallback",
+                               reason="正在确认任务栏按钮位置")
         if result.state == "fallback" and self._reservation and self._reservation.error:
             result = Placement("fallback", reason="任务栏占位未启用：" + self._reservation.error)
+        elif (result.state == "fallback" and self._reservation and not reserved
+              and (blocked is None or result.reason.startswith("任务栏空间不足"))
+              and bar.width > bar.height and bar.height >= round(38 * dpi / 96) + 4):
+            result = Placement("pending", reason="正在准备任务栏显示")
         return Placement(result.state, result.rect, result.reason, bar_hwnd)
 
     def _button_bounds(self, hwnd, bar, tray, dpi, occupied_right, reservation=None):

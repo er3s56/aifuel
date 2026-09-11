@@ -1,5 +1,6 @@
 """账户实时查询、明确降级以及 stdio 子进程生命周期的回归测试。"""
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,6 +18,80 @@ def live_payload(percent):
         "limitId": "codex", "primary": {
             "usedPercent": percent, "windowDurationMins": 10080, "resetsAt": 2000000000},
         "secondary": None}}}
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_removed_override_falls_back_to_installed_cli(self):
+        with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": "removed/codex.exe"}), \
+                patch.object(codex_live, "_executable_path", return_value=None), \
+                patch.object(codex_live.shutil, "which", return_value="installed/codex.exe"):
+            self.assertEqual(codex_live.find_codex(), "installed/codex.exe")
+
+    def test_missing_cli_is_a_retryable_local_dependency(self):
+        with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": ""}), \
+                patch.object(codex_live, "_executable_path", return_value=None), \
+                patch.object(codex_live.shutil, "which", return_value=None):
+            with self.assertRaises(codex_live.QueryError) as failure:
+                codex_live.find_codex()
+            self.assertEqual(failure.exception.kind, "dependency")
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows launcher junctions")
+class JunctionDiscoveryTests(IsolatedTest):
+    def test_installer_protection_follows_current_release_without_disabling_it(self):
+        release = self.state / "release with spaces"
+        (release / "bin").mkdir(parents=True)
+        executable = release / "bin" / "codex.exe"
+        executable.write_bytes(b"test executable")
+        current = self.state / "current"
+        local = self.state / "local"
+        launcher = local / "Programs" / "OpenAI" / "Codex" / "bin"
+        launcher.parent.mkdir(parents=True)
+        pairs = [(current, release), (launcher, current / "bin")]
+        script = "\n".join(
+            "New-Item -ItemType Junction -Path '" + str(link).replace("'", "''")
+            + "' -Target '" + str(target).replace("'", "''") + "' | Out-Null"
+            for link, target in pairs)
+        subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True,
+                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        # This protection is enabled only in the disposable child test process.
+        # A real junction must fail with 448 before testing the discovery fallback.
+        code = r'''
+import ctypes, os, sys
+from pathlib import Path
+from unittest.mock import patch
+import codex_live
+api = ctypes.WinDLL("kernel32", use_last_error=True)
+api.SetProcessMitigationPolicy.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+flags = ctypes.c_uint32(1)
+if not api.SetProcessMitigationPolicy(16, ctypes.byref(flags), ctypes.sizeof(flags)):
+    sys.exit(77 if ctypes.get_last_error() == 87 else 1)
+launcher, expected, local = sys.argv[1:]
+try:
+    os.stat(launcher)
+except OSError as error:
+    assert error.winerror == 448, error
+else:
+    raise AssertionError("Fixture did not reproduce the installer protection")
+with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": launcher}):
+    assert Path(codex_live.find_codex()).samefile(expected)
+with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": "", "PATH": str(Path(launcher).parent)}):
+    assert Path(codex_live.find_codex()).samefile(expected)
+with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": "", "PATH": "", "LOCALAPPDATA": local}):
+    assert Path(codex_live.find_codex()).samefile(expected)
+api.GetCurrentProcess.restype = ctypes.c_void_p
+api.GetProcessMitigationPolicy.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_size_t]
+assert api.GetProcessMitigationPolicy(api.GetCurrentProcess(), 16,
+                                     ctypes.byref(flags), ctypes.sizeof(flags))
+assert flags.value & 1, "Discovery must preserve the process protection"
+'''
+        result = subprocess.run([sys.executable, "-c", code, str(launcher / "codex.exe"),
+                                 str(executable), str(local)], capture_output=True, text=True,
+                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+        if result.returncode == 77:
+            self.skipTest("RedirectionGuard is unavailable on this Windows version")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class LiveSourceTests(IsolatedTest):
@@ -211,6 +286,9 @@ for line in sys.stdin:
             self.client.read_rate_limits(3)
         self.assertNotIn("private-detail", str(caught.exception))
         self.assertIsNone(self.client._process)
+        diagnostic = json.loads((self.state / "codex-failure.json").read_text(encoding="utf-8"))
+        self.assertEqual(diagnostic["phase"], "read_rate_limits")
+        self.assertNotIn("private-detail", json.dumps(diagnostic))
 
 
 if __name__ == "__main__":

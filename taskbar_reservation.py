@@ -143,6 +143,8 @@ class ReservationClient:
             self.hwnd = 0
 
     def close(self):
+        if self.closed:
+            return
         self.closed = True
         self.release()
         try:

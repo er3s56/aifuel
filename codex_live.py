@@ -1,34 +1,85 @@
 """通过已登录的 Codex app-server 查询账户额度，不创建会话或模型请求。"""
 from __future__ import annotations
 
+import errno
 import json
 import os
+from pathlib import Path
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
+import traceback
 
 from quota_policy import QueryError, retry_after_seconds
+
+
+def _resolve_launcher_links(path: str) -> str:
+    """Resolve launcher junction metadata when Windows refuses to traverse it.
+
+    Inno Setup children can inherit RedirectionGuard. Codex's stable launcher
+    contains two directory junctions, so isfile/which report it as missing (448).
+    Read those links without following them and use the physical executable;
+    retain Windows' mitigation and normal file access checks.
+    """
+    parts = list(Path(os.path.abspath(path)).parts)
+    resolved = Path(parts.pop(0))
+    links = 0
+    while parts:
+        resolved /= parts.pop(0)
+        info = os.lstat(resolved)
+        if (stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_reparse_tag", 0) == 0xA0000003):
+            links += 1
+            if links > 40:
+                raise OSError(errno.ELOOP, "Too many launcher links", path)
+            target = os.path.normpath(os.path.join(resolved.parent, os.readlink(resolved)))
+            expanded = list(Path(target).parts)
+            resolved = Path(expanded.pop(0))
+            parts = expanded + parts
+    return str(resolved)
+
+
+def _executable_path(path: str) -> str | None:
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError) as error:
+        if sys.platform != "win32" or getattr(error, "winerror", None) != 448:
+            return None
+        try:
+            path = _resolve_launcher_links(path)
+            info = os.stat(path)
+        except (OSError, ValueError):
+            return None
+    return path if stat.S_ISREG(info.st_mode) else None
 
 
 def find_codex() -> str:
     override = os.environ.get("AIFUEL_CODEX_EXE")
     if override:
-        if os.path.isfile(override):
-            return override
-        raise FileNotFoundError("AIFUEL_CODEX_EXE 指定的文件不存在")
+        override = os.path.normpath(os.path.expandvars(override.strip('"')))
+        if resolved := _executable_path(override):
+            return resolved
+        # An application update may remove an old override; rediscover the install.
     found = shutil.which("codex.exe" if sys.platform == "win32" else "codex")
     if found:
         return found
-    # Windows 安装器的标准位置；从资源管理器启动时 PATH 可能尚未更新。
-    local = os.environ.get("LOCALAPPDATA", "")
-    installed = os.path.join(local, "Programs", "OpenAI", "Codex", "bin", "codex.exe")
-    if sys.platform == "win32" and os.path.isfile(installed):
-        return installed
-    raise FileNotFoundError("找不到 Codex CLI，请安装并登录，或设置 AIFUEL_CODEX_EXE")
+    if sys.platform == "win32":
+        # which() hides junction traversal errors; retry PATH with link resolution.
+        candidates = [os.path.join(folder.strip('"'), "codex.exe")
+                      for folder in os.environ.get("PATH", "").split(os.pathsep) if folder]
+        # Explorer may still have a PATH from before the CLI was installed.
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(os.path.join(local, "Programs", "OpenAI", "Codex", "bin", "codex.exe"))
+        for candidate in candidates:
+            if resolved := _executable_path(candidate):
+                return resolved
+    raise QueryError("暂未找到 Codex 查询组件，正在自动重新检查安装位置", "dependency")
 
 
 class CodexLiveError(QueryError):
@@ -74,6 +125,22 @@ class CodexClient:
         self._reader = None
         self._messages = None
         self._next_id = 0
+        self._phase = "idle"
+
+    def _record_failure(self, error):
+        """Keep one local diagnostic; never include raw RPC text or credentials."""
+        trace = {"time": time.time(), "phase": self._phase,
+                 "type": type(error).__name__, "errno": getattr(error, "errno", None),
+                 "winerror": getattr(error, "winerror", None),
+                 "filename": getattr(error, "filename", None),
+                 "frames": [(os.path.basename(f.filename), f.name, f.lineno)
+                            for f in traceback.extract_tb(error.__traceback__)]}
+        try:
+            with open(os.path.join(os.path.dirname(self.state_dir), "codex-failure.json"),
+                      "w", encoding="utf-8") as stream:
+                json.dump(trace, stream, ensure_ascii=False)
+        except OSError:
+            pass
 
     @staticmethod
     def _read_output(stream, messages):
@@ -126,9 +193,12 @@ class CodexClient:
             try:
                 if self._process is None or self._process.poll() is not None:
                     self._stop()
+                    self._phase = "find_executable"
                     exe = find_codex()
+                    self._phase = "prepare_state_directory"
                     os.makedirs(self.state_dir, exist_ok=True)
                     # 单独存放辅助进程的 SQLite 状态，避免与桌面应用共用状态数据库。
+                    self._phase = "start_process"
                     self._process = subprocess.Popen(
                         [exe, "app-server", "-c", "sqlite_home=" + json.dumps(os.path.abspath(self.state_dir))],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -139,9 +209,11 @@ class CodexClient:
                     self._reader = threading.Thread(
                         target=self._read_output, args=(self._process.stdout, self._messages), daemon=True)
                     self._reader.start()
+                    self._phase = "initialize"
                     self._request("initialize", {"clientInfo": {
                         "name": "aifuel", "title": "aifuel", "version": "0.2.0"}}, deadline)
                     self._send({"method": "initialized", "params": {}})
+                self._phase = "read_account"
                 account = self._request("account/read", {"refreshToken": False}, deadline).get("account")
                 if account is None:
                     raise CodexLiveError("尚未登录，请先登录 Codex", "auth")
@@ -149,8 +221,10 @@ class CodexClient:
                     raise CodexLiveError("Codex 登录状态响应异常", "invalid")
                 if account.get("type") not in ("chatgpt", "chatgptAuthTokens"):
                     raise CodexLiveError("请使用 ChatGPT 账户登录 Codex 后查询订阅额度", "auth")
+                self._phase = "read_rate_limits"
                 return self._request("account/rateLimits/read", {}, deadline)
-            except Exception:
+            except Exception as error:
+                self._record_failure(error)
                 self._stop()
                 raise
 

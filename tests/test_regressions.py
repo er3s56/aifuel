@@ -195,6 +195,71 @@ class AutostartTests(IsolatedTest):
 
 @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 not installed")
 class QtTests(IsolatedTest):
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows activation event')
+    def test_reopen_during_slow_fetch_restores_window_without_waiting(self):
+        self.run_qt("""
+import subprocess, single_instance, os
+name = 'aifuel-qt-reopen-' + str(os.getpid())
+assert single_instance.acquire(name)
+release = threading.Event()
+calls = []
+def slow_read(on_result=None):
+    calls.append(1)
+    release.wait(5)
+    return []
+sources.read_all = slow_read
+w = widget_qt.QuotaWidget()
+w.show()
+drain_until(lambda: bool(calls))
+original_thread = w._thread
+w.close()
+assert w._closing and not w.isVisible()
+launcher = subprocess.Popen([sys.executable, '-c',
+    'import single_instance,sys; print(single_instance.acquire(sys.argv[1]))', name],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    creationflags=subprocess.CREATE_NO_WINDOW)
+try:
+    drain_until(lambda: not w._closing)
+    assert w.isVisible() and w._thread is original_thread
+    assert not release.is_set() and len(calls) == 1
+    assert launcher.communicate(timeout=3)[0].strip() == 'False'
+    # A duplicate activation arriving after restoration must not undo a later exit.
+    single_instance._kernel().SetEvent(single_instance._reopen)
+    w.close()
+    assert w._closing and not w._resume_if_requested()
+finally:
+    release.set()
+    if launcher.poll() is None:
+        launcher.kill()
+        launcher.communicate()
+drain_until(lambda: w._thread is None)
+w.close()
+""")
+
+    def test_taskbar_initialization_does_not_flash_floating_window(self):
+        self.run_qt("""
+from unittest.mock import Mock
+from taskbar import Placement, Rect
+sources.read_all = lambda on_result=None: []
+w = widget_qt.QuotaWidget()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+backend = w._taskbar = Mock()
+backend.is_our_window.return_value = True
+backend.placement.return_value = Placement('pending')
+w._sync_taskbar()
+assert not w.isVisible(), 'Initialization flashed a floating panel'
+backend.placement.return_value = Placement('docked', Rect(100, 100, 600, 148), '', 123)
+w._sync_taskbar()
+assert w.isVisible() and w._docked
+w.hide()
+backend.placement.return_value = Placement('pending')
+w._taskbar_pending_since = time.monotonic() - 6
+w._sync_taskbar()
+assert w.isVisible() and not w._docked, 'Failed initialization left an invisible app'
+w.close()
+""")
+
     def run_qt(self, body, platform="offscreen"):
         script = """
 import ctypes, sys, threading, time

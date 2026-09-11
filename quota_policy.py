@@ -55,7 +55,10 @@ class RetryState:
     def fail(self, error, stamp, now):
         self.kind, self.detail = error.kind, str(error)
         self.credential_stamp = stamp
-        if error.kind == "auth":
+        if error.kind == "dependency":
+            self.step = 0.0
+            delay = RETRY_FIRST  # local discovery is cheap; do not wait 15 minutes
+        elif error.kind == "auth":
             delay = AUTH_RECHECK
         else:
             first = RATE_LIMIT_FIRST if error.kind == "rate_limit" else RETRY_FIRST

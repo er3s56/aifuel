@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 from PySide6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 import autostart
 import display
 import sources
+import single_instance
 import taskbar_view
 from taskbar import WindowsTaskbar, light_theme
 
@@ -68,6 +70,7 @@ class QuotaWidget(QWidget):
         self._taskbar_light = light_theme()
         self._last_taskbar_position = None
         self._display_signature = None
+        self._taskbar_pending_since = None
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -88,6 +91,8 @@ class QuotaWidget(QWidget):
         self.display_timer.start(1000)
         self._thread = None
         self._closing = False
+        self.reopen_timer = QTimer(self)
+        self.reopen_timer.timeout.connect(self._resume_if_requested)
         self.taskbar_timer = QTimer(self)
         self.taskbar_timer.timeout.connect(self._sync_taskbar)
         if self.cfg.get("taskbar") and os.name == "nt":
@@ -127,13 +132,31 @@ class QuotaWidget(QWidget):
 
     def _fetch_finished(self) -> None:
         self._thread = None
-        if self._closing:
+        if self._closing and not self._resume_if_requested():
             self.close()
+
+    def _resume_if_requested(self):
+        if not self._closing or not single_instance.take_reopen_request():
+            return False
+        self._closing = False
+        single_instance.cancel_shutdown()
+        self.reopen_timer.stop()
+        self.display_timer.start(1000)
+        if self.cfg.get("taskbar") and os.name == "nt":
+            self.taskbar_timer.start(250)
+            self._sync_taskbar()
+        else:
+            self._restore_floating()
+        if self._thread is None:
+            self.refresh()
+        return True
 
     def _wait_for_fetch(self) -> None:
         # app.quit / 系统退出也可能绕过 closeEvent。run 不依赖 GUI 事件循环，
         # 等待它完成后才能销毁窗口及其子线程，不能强杀正在执行的网络请求。
+        single_instance.begin_shutdown()
         self._closing = True
+        self.reopen_timer.stop()
         self.timer.stop()
         self.display_timer.stop()
         self.taskbar_timer.stop()
@@ -144,17 +167,21 @@ class QuotaWidget(QWidget):
             self._thread.wait()
 
     def closeEvent(self, event) -> None:
+        single_instance.begin_shutdown()
         self._closing = True
         self.timer.stop()
         self.display_timer.stop()
         self.taskbar_timer.stop()
         self._release_taskbar()
-        if self._taskbar is not None:
-            self._taskbar.release_space(closing=True)
         if self._thread is not None:
+            if self._taskbar is not None:
+                self._taskbar.release_space()
+            self.reopen_timer.start(100)
             self.hide()
             event.ignore()             # 取数结束后由 _fetch_finished 再次关闭
         else:
+            if self._taskbar is not None:
+                self._taskbar.release_space(closing=True)
             event.accept()
             QApplication.quit()
 
@@ -256,6 +283,16 @@ class QuotaWidget(QWidget):
             self._taskbar.reserve(hwnd, width)
             placement = self._taskbar.placement(width)
             self._taskbar_note = placement.reason
+            if placement.state == "pending":
+                if self._taskbar_pending_since is None:
+                    self._taskbar_pending_since = time.monotonic()
+                if time.monotonic() - self._taskbar_pending_since < 5:
+                    self.hide()
+                    self._last_taskbar_position = None
+                    return
+                self._taskbar_note = "任务栏初始化较慢，暂以悬浮窗显示"
+            else:
+                self._taskbar_pending_since = None
             if placement.state == "hidden":
                 if self.isVisible():
                     self.hide()
@@ -456,9 +493,18 @@ class QuotaWidget(QWidget):
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--diagnose-codex":
-        # 离线缓存必须能和实时成功区分；供用户排查、也供打包后的连通性验证。
+        # Match the GUI's Qt initialization and background-thread query path.
         from dataclasses import asdict
-        readings = sources.read_codex()
+        app = QApplication([])
+        class DiagnosticWorker(QThread):
+            def run(self):
+                self.readings = sources.read_codex()
+        worker = DiagnosticWorker()
+        worker.finished.connect(app.quit)
+        worker.start()
+        app.exec()
+        worker.wait()
+        readings = worker.readings
         report = os.path.join(sources.data_dir(), "codex-report.json")
         with open(report, "w", encoding="utf-8") as f:
             json.dump([asdict(r) for r in readings], f, ensure_ascii=False, indent=2)

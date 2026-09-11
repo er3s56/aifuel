@@ -17,6 +17,22 @@ from test_regressions import IsolatedTest
 
 
 class FailurePolicyTests(IsolatedTest):
+    def test_local_dependency_failure_recovers_without_long_backoff(self):
+        first = sources.read_codex()[0]
+        self.codex.side_effect = FileNotFoundError()
+        for attempt in range(35):
+            now = 2030 + attempt * 30
+            self.clock.return_value = now
+            reading = sources.read_codex()[0]
+            self.assertEqual(reading.retry_at, now + 30)
+            self.assertEqual(display.status_text(reading), "查询重试")
+            self.assertEqual(reading.observed_at, first.observed_at)
+        self.codex.side_effect = None
+        self.clock.return_value += 30
+        recovered = sources.read_codex()[0]
+        self.assertFalse(recovered.stale)
+        self.assertEqual(recovered.failure_kind, "")
+
     def setUp(self):
         super().setUp()
         self.clock = self.enterContext(patch.object(sources.time, "time", return_value=2000.0))

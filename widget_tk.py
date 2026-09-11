@@ -180,6 +180,8 @@ class QuotaWidget:
     def close(self) -> None:
         if self._closed:
             return
+        from single_instance import begin_shutdown
+        begin_shutdown()
         self._closed = True
         for timer_id in (self._refresh_after_id, self._poll_after_id, self._display_after_id):
             if timer_id is not None:

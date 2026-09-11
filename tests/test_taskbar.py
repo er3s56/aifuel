@@ -224,24 +224,34 @@ class TaskbarProbeTests(unittest.TestCase):
         self.workers[-1].finish()
         self.assertEqual(backend._placement(600).state, "fallback")
         backend._reservation = Mock(ready=True, error="")
+        self.assertEqual(backend._placement(600).state, "pending")
+        self.workers[-1].finish()
         self.assertEqual(backend._placement(600).state, "docked")
         backend._buttons_result = None
         backend._buttons_next = float("inf")
-        # A popup can delay UIA; the native reservation remains authoritative.
-        self.assertEqual(backend._placement(600).state, "docked")
+        # Native readiness alone cannot prove that the weather/stock area is clear.
+        self.assertEqual(backend._placement(600).state, "pending")
         backend._reservation.ready = False
-        self.assertEqual(backend._placement(600).state, "fallback")
+        self.assertEqual(backend._placement(600).state, "pending")
         backend._reservation.ready = True
-        self.assertEqual(backend._placement(600).state, "docked")
+        self.assertEqual(backend._placement(600).state, "pending")
+        stock = Rect(1440, 1032, 1650, 1080)
+        backend._buttons_result = (backend._buttons_key, self.now, (stock,))
+        position = backend._placement(600)
+        self.assertEqual(position.state, "docked")
+        self.assertLess(position.rect.right, stock.left)
         backend._buttons_result = (backend._buttons_key, self.now, (Rect(0, 1032, 1660, 1080),))
         self.assertEqual(backend._placement(600).state, "fallback")  # still honor known obstacles
         # Changing reservation width invalidates bounds from the old allocation.
-        self.assertEqual(backend._placement(620).state, "docked")
+        self.assertEqual(backend._placement(620).state, "pending")
         backend.release_space()
         self.assertIsNone(backend._buttons_key)
         self.assertIsNone(backend._buttons_result)
         self.bar, self.tray = Rect(0, 1008, 1920, 1080), Rect(1660, 1008, 1920, 1080)
         backend.api.GetDpiForWindow.return_value = 144
+        self.workers[-1].finish()  # Drain the obsolete scan before querying the new DPI.
+        self.assertEqual(backend._placement(403).state, "pending")
+        self.workers[-1].finish()
         self.assertEqual(backend._placement(403).rect.width, 605)
         self.bar, self.tray = Rect(0, 1078, 1920, 1126), Rect(1660, 1078, 1920, 1126)
         self.assertEqual(backend._placement(600).state, "hidden")

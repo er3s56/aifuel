@@ -210,7 +210,9 @@ def _query_provider(provider, fetch, timeout, min_interval=0):
             elif isinstance(exc, (TimeoutError, urllib.error.URLError)):
                 error = QueryError("额度查询超时" if isinstance(exc, TimeoutError) else "网络连接失败")
             elif isinstance(exc, FileNotFoundError):
-                error = QueryError("找不到 Codex CLI，请安装并登录，或检查 AIFUEL_CODEX_EXE", "setup")
+                # FileNotFoundError can also come from process startup/state files.
+                # It does not prove that the CLI or the user's login is missing.
+                error = QueryError("本地查询文件暂不可用，正在自动重新检查", "dependency")
             elif isinstance(exc, (ValueError, TypeError, KeyError, AttributeError, OverflowError)):
                 error = QueryError("额度响应格式异常或缺少有效额度字段", "invalid")
             else:
@@ -434,25 +436,14 @@ def read_all(on_result=None) -> "list[Reading]":
 
 # ---------------------------------------------------------------- 单实例
 
-_mutex_handle = None
-
-
 def acquire_single_instance(name: str = "aifuel_widget") -> bool:
     """确保同时只有一份在跑。
 
     多开的代价不是难看，是每个实例都在敲 /api/oauth/usage，很容易把
     自己撞到 429。返回 False 表示已经有一份在跑了，调用方应当退出。
     """
-    global _mutex_handle
-    if sys.platform != "win32":
-        return True
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        _mutex_handle = kernel32.CreateMutexW(None, False, "Local\\" + name)
-        return kernel32.GetLastError() != 183      # ERROR_ALREADY_EXISTS
-    except Exception:
-        return True                                 # 拿不到锁就别挡着用户
+    from single_instance import acquire
+    return acquire(name)
 
 
 if __name__ == "__main__":

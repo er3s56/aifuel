@@ -7,7 +7,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "1.7.3"
-MOD_VERSION = "1.0.2"
+MOD_VERSION = "1.0.3"
 SETUP_SHA256 = "4d93016570f982326eebdfc9068e924ff21f6448534ea32672bb4c1d52a8193b"
 
 

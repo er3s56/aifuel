@@ -2,7 +2,7 @@
 // @id              aifuel-taskbar-space
 // @name            aifuel taskbar space
 // @description     Reserve space beside the system tray while aifuel is running
-// @version         1.0.2
+// @version         1.0.3
 // @author          aifuel contributors
 // @include         explorer.exe
 // @architecture    amd64
@@ -101,10 +101,16 @@ void Tick() {
     }
     double want = content.ActualWidth() - width;
     if (iconArea.Width() != want) {
+        RemoveProp(quota, kReady);
         iconArea.HorizontalAlignment(HorizontalAlignment::Left);
         iconArea.Width(want);
         appliedWidth = want;
         Wh_Log(L"Reserved %u DIPs; button area width %.1f", static_cast<unsigned>(width), want);
+        return;  // XAML arranges asynchronously; setting Width is not completion.
+    }
+    if (iconArea.ActualWidth() < want - 0.5 || iconArea.ActualWidth() > want + 0.5) {
+        RemoveProp(quota, kReady);
+        return;
     }
     SetProp(quota, kReady, reinterpret_cast<HANDLE>(width));
 }
