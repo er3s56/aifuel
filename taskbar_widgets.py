@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""只读查询 Windows 11 天气按钮边界；使用系统 COM，不依赖 pywin32。"""
+"""只读查询任务栏实际按钮边界；使用系统 COM，不依赖 pywin32。"""
 import ctypes as c
 from ctypes import wintypes as w
 import uuid
@@ -13,7 +13,8 @@ class _Guid(c.Structure):
 
 
 class _Value(c.Union):
-    _fields_ = [("pointer", c.c_void_p), ("record", c.c_void_p * 2), ("number", c.c_double)]
+    _fields_ = [("pointer", c.c_void_p), ("record", c.c_void_p * 2),
+                ("number", c.c_double), ("integer", c.c_long)]
 
 
 class _Variant(c.Structure):
@@ -29,17 +30,40 @@ def _method(pointer, index, args, *values):
         raise OSError("Windows UI Automation query failed: 0x%08x" % (result & 0xffffffff))
 
 
-def widget_rect(hwnd):
-    """在线程中调用，返回物理像素边界或 None（无天气按钮）；失败抛出 OSError。"""
+def _button_rects(elements):
+    count = c.c_int()
+    _method(elements, 3, [c.POINTER(c.c_int)], c.byref(count))
+    result = []
+    for index in range(count.value):
+        button = c.c_void_p()
+        _method(elements, 4, [c.c_int, c.POINTER(c.c_void_p)], index, c.byref(button))
+        try:
+            offscreen = w.BOOL()
+            _method(button, 38, [c.POINTER(w.BOOL)], c.byref(offscreen))
+            if offscreen.value:
+                continue
+            rect = w.RECT()
+            _method(button, 43, [c.POINTER(w.RECT)], c.byref(rect))
+            if rect.right > rect.left and rect.bottom > rect.top:
+                result.append((rect.left, rect.top, rect.right, rect.bottom))
+        finally:
+            if button:
+                _method(button, 2, [])
+    return tuple(result)
+
+
+def taskbar_button_rects(hwnd):
+    """在线程中调用，返回所有可见按钮的物理像素边界；失败抛出 OSError。
+
+    应用、开始、搜索、溢出和天气入口统一避让，不依赖 Windows 的内部类名。
+    不能用 ReBar/MSTaskSw 容器推断空白：Windows 11 按钮会伸出其边界。
+    """
     ole = c.WinDLL("ole32")
-    auto = c.WinDLL("oleaut32")
     ole.CoInitializeEx.argtypes, ole.CoInitializeEx.restype = [c.c_void_p, w.DWORD], c.c_long
     ole.CoUninitialize.argtypes = []
     ole.CoCreateInstance.argtypes = [c.POINTER(_Guid), c.c_void_p, w.DWORD,
                                     c.POINTER(_Guid), c.POINTER(c.c_void_p)]
     ole.CoCreateInstance.restype = c.c_long
-    auto.SysAllocString.argtypes, auto.SysAllocString.restype = [w.LPCWSTR], c.c_void_p
-    auto.VariantClear.argtypes = [c.POINTER(_Variant)]
     if ole.CoInitializeEx(None, 0) < 0:
         raise OSError("Windows UI Automation initialization failed")
     pointers = []
@@ -58,31 +82,20 @@ def widget_rect(hwnd):
         element = c.c_void_p()
         _method(client, 6, [w.HWND, c.POINTER(c.c_void_p)], hwnd, c.byref(element))
         pointers.append(element)
-        value.vt = 8  # VT_BSTR; UIA_AutomationIdPropertyId = 30011
-        value.pointer = auto.SysAllocString("WidgetsButton")
-        if not value.pointer:
-            raise OSError("Cannot allocate UI Automation condition")
+        value.vt = 3  # VT_I4; UIA_ControlTypePropertyId = 30003
+        value.integer = 50000  # UIA_ButtonControlTypeId
         condition = c.c_void_p()
         _method(client, 23, [c.c_int, _Variant, c.POINTER(c.c_void_p)],
-                30011, value, c.byref(condition))
+                30003, value, c.byref(condition))
         pointers.append(condition)
         found = c.c_void_p()
-        _method(element, 5, [c.c_int, c.c_void_p, c.POINTER(c.c_void_p)],
+        _method(element, 6, [c.c_int, c.c_void_p, c.POINTER(c.c_void_p)],
                 4, condition, c.byref(found))  # TreeScope_Descendants
-        if not found:
-            return None
         pointers.append(found)
-        offscreen = w.BOOL()
-        _method(found, 38, [c.POINTER(w.BOOL)], c.byref(offscreen))
-        if offscreen.value:
-            return None
-        rect = w.RECT()
-        _method(found, 43, [c.POINTER(w.RECT)], c.byref(rect))
-        if rect.right <= rect.left or rect.bottom <= rect.top:
-            return None
-        return (rect.left, rect.top, rect.right, rect.bottom)
+        if not found:
+            raise OSError("Taskbar buttons unavailable")
+        return _button_rects(found)
     finally:
-        auto.VariantClear(c.byref(value))
         for pointer in reversed(pointers):
             if pointer:
                 _method(pointer, 2, [])

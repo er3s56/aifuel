@@ -43,10 +43,14 @@ $args = @(
   "--name", $name,
   "--distpath", $DistPath,
   "--icon", "aifuel.ico",
+  "--add-data", "build\taskbar-runtime;taskbar_runtime",
   "--log-level", "WARN"
 )
 foreach ($e in $excludes) { $args += @("--exclude-module", $e) }
 $args += "widget_qt.py"
+
+& $py native/build_runtime.py
+if ($LASTEXITCODE -ne 0) { Write-Output "任务栏扩展构建失败"; exit 1 }
 
 Write-Output "开始构建…"
 # PyInstaller 会沿 PATH 查 DLL。Poppler 等工具的 icuuc.dll 与 Windows 同名，

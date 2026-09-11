@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Windows 任务栏定位。只移动 aifuel 自己的窗口，不修改 Explorer 的布局。"""
+"""Windows 任务栏定位，配合独立占位扩展为额度面板预留空间。"""
 from __future__ import annotations
 
 import ctypes
@@ -9,7 +9,8 @@ import os
 import threading
 import time
 
-from taskbar_widgets import widget_rect
+from taskbar_widgets import taskbar_button_rects
+from taskbar_reservation import ReservationClient
 
 
 @dataclass(frozen=True)
@@ -55,10 +56,10 @@ def arrange(bar: Rect, tray: Rect, monitor: Rect, occupied_right: int,
     if height < round(38 * dpi / 96):
         return Placement("fallback", reason="任务栏高度不足，暂以悬浮窗显示")
     right = tray.left - gap
-    # 从右向左寻找能容纳整块额度窗的空隙，天气按钮两侧都留出点击间距。
+    # 从右向左寻找能容纳整块额度窗的空隙，每个按钮两侧都留出点击间距。
     for obstacle in sorted(blocked, key=lambda rect: rect.left, reverse=True):
         if (obstacle.bottom > bar.top and obstacle.top < bar.bottom
-                and obstacle.left < right and obstacle.right > right - width):
+                and obstacle.left < right + gap and obstacle.right > right - width - gap):
             right = obstacle.left - gap
     left = right - width
     if left < max(bar.left, occupied_right) + gap:
@@ -77,11 +78,13 @@ class WindowsTaskbar:
         if os.name != "nt":
             raise OSError("任务栏模式仅支持 Windows")
         self.api = ctypes.WinDLL("user32", use_last_error=True)
-        self._widget_key = None
-        self._widget_result = None
-        self._widget_worker = None
-        self._widget_next = 0.0
+        self._buttons_key = None
+        self._buttons_result = None
+        self._buttons_worker = None
+        self._buttons_next = 0.0
+        self._buttons_epoch = 0
         self._owned_window = None
+        self._reservation = None
         self.callback_type = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
         signatures = {
             "FindWindowW": ([wt.LPCWSTR, wt.LPCWSTR], wt.HWND),
@@ -113,6 +116,22 @@ class WindowsTaskbar:
         if not self.api.GetWindowRect(hwnd, ctypes.byref(value)):
             raise ctypes.WinError(ctypes.get_last_error())
         return Rect(value.left, value.top, value.right, value.bottom)
+
+    def reserve(self, hwnd, logical_width):
+        if self._reservation is None:
+            self._reservation = ReservationClient(self.api)
+        self._reservation.request(hwnd, logical_width)
+
+    def release_space(self, closing=False):
+        # A later reservation must not reuse button positions measured before it.
+        self._buttons_key = self._buttons_result = None
+        self._buttons_next = 0.0
+        self._buttons_epoch += 1
+        if self._reservation is not None:
+            if closing:
+                self._reservation.close()
+            else:
+                self._reservation.release()
 
     def _class(self, hwnd):
         value = ctypes.create_unicode_buffer(256)
@@ -171,37 +190,52 @@ class WindowsTaskbar:
 
         self.api.EnumChildWindows(bar_hwnd, child, 0)
         dpi = self.api.GetDpiForWindow(bar_hwnd) or 96
-        blocked = self._widget_bounds(bar_hwnd, bar, tray, dpi)
-        result = arrange(bar, tray, monitor, occupied_right,
-                         round(logical_width * dpi / 96), dpi, blocked)
+        # 扩展已确认按当前宽度缩小按钮区域，UIA 暂时卡住也不能撤销占位。
+        # 有新鲜按钮边界时仍检查额外控件；未启用扩展时必须等扫描确认。
+        reserved = bool(self._reservation and self._reservation.ready)
+        reservation = (self._reservation.hwnd, logical_width) if reserved else None
+        blocked = self._button_bounds(bar_hwnd, bar, tray, dpi, occupied_right, reservation)
+        boundary = bar.left if reserved else occupied_right
+        # Qt rounds positive half pixels upward; Python round() uses ties-to-even.
+        # Match Qt so a mode switch does not change a 403-DIP panel by one pixel.
+        physical_width = int(logical_width * dpi / 96 + .5)
+        result = arrange(bar, tray, monitor, boundary,
+                         physical_width, dpi, blocked or ())
+        if result.state == "docked" and blocked is None and not reserved:
+            result = Placement("fallback", reason="暂未确认任务栏空闲区域，暂以悬浮窗显示")
+        if result.state == "fallback" and self._reservation and self._reservation.error:
+            result = Placement("fallback", reason="任务栏占位未启用：" + self._reservation.error)
         return Placement(result.state, result.rect, result.reason, bar_hwnd)
 
-    def _widget_bounds(self, hwnd, bar, tray, dpi):
-        key = (hwnd, bar, tray, dpi)
-        if key != self._widget_key:
-            self._widget_key, self._widget_result, self._widget_next = key, None, 0
+    def _button_bounds(self, hwnd, bar, tray, dpi, occupied_right, reservation=None):
+        key = (hwnd, bar, tray, dpi, occupied_right, reservation, self._buttons_epoch)
+        if key != self._buttons_key:
+            self._buttons_key, self._buttons_next = key, 0
         now = time.monotonic()
-        if now >= self._widget_next and not (self._widget_worker and self._widget_worker.is_alive()):
-            self._widget_next = now + 3
+        if now >= self._buttons_next and not (self._buttons_worker and self._buttons_worker.is_alive()):
+            self._buttons_next = now + .5
 
             def query():
                 try:
-                    value = widget_rect(hwnd)
-                    result = () if value is None else (Rect(*value),)
+                    result = tuple(Rect(*value) for value in taskbar_button_rects(hwnd))
+                    # 只有托盘或没有按钮，可能是 Explorer 的 UIA 树尚未就绪。
+                    if not any(rect.left < tray.left and rect.right > bar.left
+                               and rect.top < bar.bottom and rect.bottom > bar.top
+                               for rect in result):
+                        result = None
                 except Exception:
                     result = None
-                if self._widget_key == key:
-                    self._widget_result = result
+                # 连同布局标识一起发布，旧查询完成时不能覆盖新位置的判断。
+                self._buttons_result = (key, now, result)
 
             # UI Automation 的跨进程查询不能阻塞 Qt 主线程；只允许一个查询在途。
-            self._widget_worker = threading.Thread(target=query, daemon=True)
-            self._widget_worker.start()
-        if self._widget_result is not None:
-            return self._widget_result
-        # 首次查询/探测失败时为左对齐任务栏保留天气空间，不能抢占未知区域。
-        if _setting("Explorer\\Advanced", "TaskbarAl", 1) == 0:
-            return (Rect(tray.left - round(220 * dpi / 96), bar.top, tray.left, bar.bottom),)
-        return ()
+            self._buttons_worker = threading.Thread(target=query, daemon=True)
+            self._buttons_worker.start()
+        snapshot = self._buttons_result
+        if snapshot and snapshot[0] == key and now - snapshot[1] <= 1.5:
+            return snapshot[2]
+        # 首次查询、布局变化或查询卡住时不能把未知区域当成空白。
+        return None
 
     def _set_owner(self, hwnd, owner):
         ctypes.set_last_error(0)

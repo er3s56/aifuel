@@ -10,8 +10,8 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath
+from PySide6.QtCore import QPoint, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 
 import autostart
@@ -138,6 +138,8 @@ class QuotaWidget(QWidget):
         self.display_timer.stop()
         self.taskbar_timer.stop()
         self._release_taskbar()
+        if self._taskbar is not None:
+            self._taskbar.release_space(closing=True)
         if self._thread is not None:
             self._thread.wait()
 
@@ -147,6 +149,8 @@ class QuotaWidget(QWidget):
         self.display_timer.stop()
         self.taskbar_timer.stop()
         self._release_taskbar()
+        if self._taskbar is not None:
+            self._taskbar.release_space(closing=True)
         if self._thread is not None:
             self.hide()
             event.ignore()             # 取数结束后由 _fetch_finished 再次关闭
@@ -235,6 +239,8 @@ class QuotaWidget(QWidget):
             self._sync_taskbar()
         else:
             self.taskbar_timer.stop()
+            if self._taskbar is not None:
+                self._taskbar.release_space()
             self._taskbar_note = ""
             self._restore_floating()
         self._update_display()
@@ -247,6 +253,7 @@ class QuotaWidget(QWidget):
             if self._taskbar is None:
                 self._taskbar = WindowsTaskbar()
             hwnd = self._ensure_native_window()
+            self._taskbar.reserve(hwnd, width)
             placement = self._taskbar.placement(width)
             self._taskbar_note = placement.reason
             if placement.state == "hidden":
@@ -292,13 +299,15 @@ class QuotaWidget(QWidget):
         self._drag_pos = None
 
     def mouseDoubleClickEvent(self, e) -> None:
-        self.refresh()
+        if e.button() == Qt.LeftButton:
+            self.refresh()
 
     def contextMenuEvent(self, e) -> None:
+        if self._closing:
+            return
         m = QMenu(self)
-        act = QAction("立即刷新", self)
+        act = m.addAction("立即刷新")
         act.triggered.connect(self.refresh)
-        m.addAction(act)
         detail_action = m.addAction("额度详情（百分比为已用）")
         detail_action.triggered.connect(lambda: QMessageBox.information(
             self, "额度详情", display.details(self.readings)))
@@ -310,21 +319,37 @@ class QuotaWidget(QWidget):
         sub = m.addMenu("不透明度")
         sub.setEnabled(not self._docked)
         for a in (1.0, 0.94, 0.8, 0.6):
-            act = QAction("%d%%" % (a * 100), self)
+            act = sub.addAction("%d%%" % (a * 100))
             act.triggered.connect(lambda _c=False, v=a: self._set_alpha(v))
-            sub.addAction(act)
 
-        act = QAction("开机自启", self)
+        act = m.addAction("开机自启")
         act.setCheckable(True)
         act.setChecked(autostart.is_enabled())      # 状态直接读快捷方式是否存在
         act.triggered.connect(self._toggle_autostart)
-        m.addAction(act)
 
         m.addSeparator()
-        act = QAction("退出", self)
+        act = m.addAction("退出")
         act.triggered.connect(self.close)
-        m.addAction(act)
-        m.exec(e.globalPos())
+        try:
+            m.exec(self._menu_position(m, e.globalPos()))
+        finally:
+            # Menu actions belong to the menu; release the whole popup after it
+            # finishes dispatching callbacks (including mode changes and exit).
+            m.deleteLater()
+
+    def _menu_position(self, menu, cursor):
+        if not self._docked:
+            return cursor
+        menu.ensurePolished()
+        size = menu.sizeHint()
+        area = self.screen().availableGeometry()
+        panel = self.frameGeometry()
+        # Bottom taskbar: open above it. A top taskbar opens below instead.
+        y = panel.top() - size.height() - 4
+        if y < area.top():
+            y = panel.bottom() + 5
+        x = min(cursor.x(), area.right() - size.width() + 1)
+        return QPoint(max(area.left(), x), max(area.top(), min(y, area.bottom() - size.height() + 1)))
 
     def _toggle_autostart(self, checked: bool) -> None:
         ok, msg = autostart.enable() if checked else autostart.disable()
@@ -462,6 +487,8 @@ def main() -> None:
         except Exception:
             pass
         if sys.stdout is not None:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8")
             print(report)
         sys.exit(0)
 

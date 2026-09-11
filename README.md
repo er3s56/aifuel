@@ -47,12 +47,22 @@ Claude 的额度类型不做白名单；GPT 显示 Codex 主额度及启用的�
 也可以用 `aifuel.exe --taskbar` 开启，或 `aifuel.exe --floating` 恢复悬浮窗。
 
 窗口定位于主任务栏的托盘左侧，跟随任务栏位置和 DPI；任务栏自动隐藏或当前屏幕
-有全屏应用时隐藏，Explorer 恢复后重新定位。额度项过多、任务栏空间不足或高度过低时，
-自动以完整悬浮窗显示，并在悬停详情里注明原因；空间恢复后自动回到任务栏。
-天气按钮通过 Windows UI Automation 在后台只读识别，按实际边界避让；查询尚未完成
-或不可用时，左对齐任务栏会先保留天气区域，不覆盖它的点击入口。
-这是贴合任务栏的独立窗口，不会为额度挤开系统图标；Windows 更新或任务栏定制工具
-改变内部布局时可能需要适配。Tk 备选版继续使用悬浮窗。
+有全屏应用时隐藏，Explorer 恢复后重新定位。Windows 11 x64 下会自动启用随程序打包的
+**固定占位扩展**：给额度面板预留宽度，应用按钮在剩余区域排列，拥挤时由 Windows
+缩小按钮或显示溢出入口。因此任务增加时，额度面板仍可留在任务栏中。
+
+占位由便携版 Windhawk 加载，只修改主任务栏布局。运行文件放在
+`%LOCALAPPDATA%\aifuel\taskbar-runtime\`，不安装系统服务、不增加开机自启项。
+切回悬浮窗立即释放占位，退出 aifuel 时关闭专用扩展进程；异常退出或主线程停止响应时，
+扩展约两秒后恢复原有布局。首次使用可能需要下载当前 Windows 的符号，升级时复用
+本机已下载的符号文件。
+如果已有另一个 Windhawk 在运行，程序会提示手动集成扩展，不会关闭或修改那份安装。
+
+占位未生效时，程序通过 Windows UI Automation 在后台识别应用、开始、搜索、溢出和
+天气按钮，确认空闲区域后显示。无法确认空闲区域、空间不足或任务栏高度过低时，
+暂以完整悬浮窗显示，悬停详情注明原因；条件恢复后自动回到任务栏。
+占位已确认生效时，按钮扫描短暂超时不会让面板跳回悬浮位置。
+Windows 更新或任务栏定制工具改变内部布局时可能需要适配。Tk 备选版继续使用悬浮窗。
 
 面板约 **30 秒**检查一次更新。GPT 正常约 30 秒查询一次；Claude 的正常查询间隔
 至少 **2 分钟**，间隔内沿用上次成功读数。手动刷新和重启也遵守 Claude 的最小间隔。
@@ -153,7 +163,8 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 | `display.py` | 显示决策：什么数字、什么颜色、要不要压暗。两版共用 |
 | `widget_qt.py` / `widget_tk.py` | 两个前端 |
 | `taskbar.py` | Windows 任务栏定位、全屏隐藏和空间不足判断 |
-| `taskbar_widgets.py` / `taskbar_view.py` | 天气按钮边界查询、任务栏紧凑排版与主题配色 |
+| `taskbar_widgets.py` / `taskbar_view.py` | 任务栏按钮边界查询、紧凑排版与主题配色 |
+| `taskbar_reservation.py` / `native/` | 固定占位租约、便携运行时和独立任务栏扩展 |
 | `make_icon.py` | 生成 `aifuel.ico` |
 | `build.ps1` | 打包。加 `-Debug` 出带控制台的版本，能看崩溃回溯 |
 
@@ -165,6 +176,11 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
+
+构建会先运行 `native/build_runtime.py`：首次下载并校验固定版本的 Windhawk 编译环境，
+编译占位扩展，再把精简运行时和扩展源码一起打包。源码运行前也可单独执行
+`python native/build_runtime.py`。运行 exe 不需要编译器，也不会下载或编译扩展代码。
+Python 应用为 MIT 协议；独立占位扩展为 GPL-3.0，详见 `native/THIRD_PARTY.md`。
 
 排除模块时**别碰 `email` / `http` / `xml`**：`urllib.request` 靠 `email.message`
 解析 HTTP 头，排掉它 exe 会在启动时静默崩溃（`--windowed` 会把回溯吞掉）。

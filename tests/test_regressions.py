@@ -285,6 +285,127 @@ assert w._thread is None or not w._thread.isRunning()
     def test_menu_close_during_fetch_exits_cleanly(self):
         self.check_quit_during_fetch("w.close")
 
+    def test_context_menus_release_actions_after_repeated_open_and_close(self):
+        self.run_qt("""
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QAction, QContextMenuEvent
+from PySide6.QtWidgets import QMenu
+sources.read_all = lambda **kwargs: []
+w = widget_qt.QuotaWidget()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+w.show()
+menus = len(w.findChildren(QMenu))
+actions = len(w.findChildren(QAction))
+for _ in range(12):
+    QTimer.singleShot(0, lambda: app.activePopupWidget().close())
+    event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(5, 5), w.mapToGlobal(QPoint(5, 5)))
+    app.sendEvent(w, event)
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert len(w.findChildren(QMenu)) == menus, 'Closed context menus leaked'
+    assert len(w.findChildren(QAction)) == actions, 'Closed menu actions leaked'
+w.close()
+""")
+
+    def test_context_menu_mode_switches_details_and_mouse_buttons(self):
+        self.run_qt("""
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QContextMenuEvent, QMouseEvent
+from PySide6.QtWidgets import QMessageBox
+from unittest.mock import patch
+from taskbar import Placement, Rect
+sources.read_all = lambda **kwargs: [sources.Reading('chatgpt', 'wk', 25)]
+w = widget_qt.QuotaWidget()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+w.cfg.update(x=40, y=60)
+w.move(40, 60)
+w.show()
+
+class Taskbar:
+    reserved = False
+    def reserve(self, hwnd, width): self.reserved = True
+    def release_space(self, closing=False): self.reserved = False
+    def is_our_window(self, hwnd): return True
+    def attach(self, hwnd, owner): pass
+    def detach(self): pass
+    def placement(self, width):
+        return Placement('docked', Rect(10, 100, 10 + width, 148), '', 123)
+    def move(self, hwnd, rect):
+        w.setGeometry(rect.left, rect.top, rect.width, rect.height)
+w._taskbar = Taskbar()
+errors = []
+def choose(label, before=None):
+    def action():
+        menu = app.activePopupWidget()
+        try:
+            assert menu
+            selected = next(a for a in menu.actions() if a.text().startswith(label))
+            if before: before(menu)
+            menu.close()
+            selected.trigger()
+        except Exception as error:
+            errors.append(error)
+            if menu: menu.close()
+    QTimer.singleShot(0, action)
+    app.sendEvent(w, QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(5, 5), w.mapToGlobal(QPoint(5, 5))))
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert not errors, errors
+
+choose('显示在任务栏')
+assert w._docked and w._taskbar.reserved
+def check_disabled(menu):
+    assert not next(a for a in menu.actions() if a.text() == '不透明度').isEnabled()
+choose('显示在任务栏', check_disabled)
+assert not w._docked and not w._taskbar.reserved
+assert (w.x(), w.y()) == (40, 60)
+choose('显示在任务栏')
+def dismiss_details():
+    dialog = app.activeModalWidget()
+    try:
+        assert isinstance(dialog, QMessageBox)
+        assert '25%' in dialog.text() and w._docked and w._taskbar.reserved
+    except Exception as error:
+        errors.append(error)
+    finally:
+        if dialog: dialog.accept()
+choose('额度详情', lambda menu: QTimer.singleShot(0, dismiss_details))
+assert w._docked and w._taskbar.reserved
+with patch.object(w, 'refresh') as refresh:
+    for button in (Qt.RightButton, Qt.MiddleButton, Qt.LeftButton):
+        app.sendEvent(w, QMouseEvent(QEvent.MouseButtonDblClick, QPointF(5, 5), QPointF(5, 5),
+                                    button, button, Qt.NoModifier))
+    refresh.assert_called_once()
+w.close()
+""")
+
+    def test_taskbar_menu_stays_on_screen_and_clear_of_the_panel(self):
+        self.run_qt("""
+from PySide6.QtCore import QPoint, QRect
+from PySide6.QtWidgets import QMenu
+sources.read_all = lambda **kwargs: []
+w = widget_qt.QuotaWidget()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+w.show()
+menu = QMenu(w)
+for label in ('Refresh', 'Details', 'Taskbar', 'Opacity', 'Autostart', 'Exit'):
+    menu.addAction(label)
+area = w.screen().availableGeometry()
+w._docked = True
+for top in (False, True):
+    y = area.top() if top else area.bottom() - 47
+    w.setGeometry(area.right() - 299, y, 300, 48)
+    position = w._menu_position(menu, QPoint(area.right(), y + 24))
+    popup = QRect(position, menu.sizeHint())
+    assert area.contains(popup), 'Menu must fit the available screen'
+    assert not popup.intersects(w.frameGeometry()), 'Menu covers taskbar quota text'
+w._docked = False
+cursor = QPoint(100, 200)
+assert w._menu_position(menu, cursor) == cursor
+w.close()
+""")
+
     def test_application_quit_during_fetch_exits_cleanly(self):
         self.check_quit_during_fetch("app.quit")
 
@@ -311,6 +432,10 @@ class Taskbar:
     state = 'docked'
     moves = 0
     owner = None
+    def reserve(self, hwnd, width):
+        self.reserved = True
+    def release_space(self, closing=False):
+        self.reserved = False
     def is_our_window(self, hwnd):
         return True
     def placement(self, width):
@@ -357,6 +482,7 @@ w._taskbar.state = 'docked'
 w._sync_taskbar()
 assert w._docked
 w._set_taskbar(False)
+assert not w._taskbar.reserved
 assert not w.taskbar_timer.isActive() and not w._docked
 assert w.x() == 40 and w.y() == 60 and w.width() == 300
 assert len(calls) == 1, 'Changing display mode must not query quotas'
@@ -385,6 +511,8 @@ drain_until(lambda: w._thread is None)
 w.timer.stop()
 
 class Taskbar(WindowsTaskbar):
+    def reserve(self, hwnd, width):
+        pass  # This test owns a synthetic taskbar, not the real Explorer taskbar.
     owner = 0
     def placement(self, width):
         return (Placement('docked', Rect(-32000, -32000, -31600, -31950), '', self.owner)
