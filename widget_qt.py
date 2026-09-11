@@ -304,12 +304,15 @@ class QuotaWidget(QWidget):
                 if changed_mode:
                     self.setWindowOpacity(1.0)
                 position = (placement.rect, placement.taskbar_hwnd)
-                if position != self._last_taskbar_position or not self.isVisible():
-                    self._taskbar.move(hwnd, placement.rect)
+                if (position != self._last_taskbar_position or not self.isVisible()
+                        or not self._taskbar.position_matches(hwnd, placement.rect)):
                     if not self.isVisible():
                         self.show()
-                    # Qt 显示/重建原生窗口时会设置 owner，必须在 show 之后绑定。
-                    self._taskbar.attach(int(self.winId()), placement.taskbar_hwnd)
+                    # show() applies Qt's cached floating geometry. Position the
+                    # current native window afterwards, then bind its owner.
+                    hwnd = int(self.winId())
+                    self._taskbar.move(hwnd, placement.rect)
+                    self._taskbar.attach(hwnd, placement.taskbar_hwnd)
                     self._last_taskbar_position = position
                 if changed_mode:
                     self.update()

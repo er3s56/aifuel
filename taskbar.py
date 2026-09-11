@@ -279,6 +279,9 @@ class WindowsTaskbar:
                 self._set_owner(hwnd, previous if self.api.IsWindow(previous) else 0)
             self._owned_window = None
 
+    def position_matches(self, hwnd: int, rect: Rect):
+        return self._rect(hwnd) == rect
+
     def move(self, hwnd: int, rect: Rect):
         previous = self.api.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
         try:

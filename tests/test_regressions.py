@@ -195,6 +195,39 @@ class AutostartTests(IsolatedTest):
 
 @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 not installed")
 class QtTests(IsolatedTest):
+    @unittest.skipUnless(sys.platform == 'win32', 'Native Windows geometry')
+    def test_first_dock_keeps_native_geometry_after_show(self):
+        self.run_qt("""
+from unittest.mock import Mock
+from taskbar import WindowsTaskbar, Placement, Rect
+sources.read_all = lambda on_result=None: []
+w = widget_qt.QuotaWidget()
+drain_until(lambda: w._thread is None)
+w.timer.stop()
+backend = w._taskbar = WindowsTaskbar()
+backend.reserve = Mock()
+backend.attach = Mock()
+backend.release_space = Mock()
+target = Rect(100, 200, 700, 248)
+backend.placement = Mock(return_value=Placement('docked', target, '', 123))
+w._sync_taskbar()
+app.processEvents()
+assert backend._rect(int(w.winId())) == target, (backend._rect(int(w.winId())), target)
+backend.move = Mock(wraps=backend.move)
+w._sync_taskbar()
+backend.move.assert_not_called()  # Stable ticks must not move/reorder the window.
+w.move(300, 100)  # A later Qt geometry update must not defeat the cached placement.
+app.processEvents()
+w._sync_taskbar()
+assert backend._rect(int(w.winId())) == target
+backend.move.assert_called_once()
+w.hide()
+w._sync_taskbar()
+app.processEvents()
+assert w.isVisible() and backend._rect(int(w.winId())) == target
+w.close()
+""", platform="windows")
+
     @unittest.skipUnless(sys.platform == 'win32', 'Windows activation event')
     def test_reopen_during_slow_fetch_restores_window_without_waiting(self):
         self.run_qt("""
@@ -394,6 +427,8 @@ class Taskbar:
     def is_our_window(self, hwnd): return True
     def attach(self, hwnd, owner): pass
     def detach(self): pass
+    def position_matches(self, hwnd, rect):
+        return (w.x(), w.y(), w.width(), w.height()) == (rect.left, rect.top, rect.width, rect.height)
     def placement(self, width):
         return Placement('docked', Rect(10, 100, 10 + width, 148), '', 123)
     def move(self, hwnd, rect):
@@ -509,6 +544,8 @@ class Taskbar:
         self.owner = owner
     def detach(self):
         self.owner = None
+    def position_matches(self, hwnd, rect):
+        return (w.x(), w.y(), w.width(), w.height()) == (rect.left, rect.top, rect.width, rect.height)
     def move(self, hwnd, rect):
         self.moves += 1
         w.setGeometry(rect.left, rect.top, rect.width, rect.height)
