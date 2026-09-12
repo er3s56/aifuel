@@ -211,7 +211,7 @@ class CodexClient:
                     self._reader.start()
                     self._phase = "initialize"
                     self._request("initialize", {"clientInfo": {
-                        "name": "aifuel", "title": "aifuel", "version": "0.2.0"}}, deadline)
+                        "name": "aifuel", "title": "aifuel", "version": "0.2.1"}}, deadline)
                     self._send({"method": "initialized", "params": {}})
                 self._phase = "read_account"
                 account = self._request("account/read", {"refreshToken": False}, deadline).get("account")

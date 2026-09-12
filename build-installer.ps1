@@ -1,7 +1,7 @@
 ﻿# Build the application and then its per-user Windows installer.
 param(
     [ValidatePattern('^\d{1,4}\.\d{1,4}\.\d{1,4}$')]
-    [string]$Version = '0.1.3',
+    [string]$Version = '0.2.1',
     [string]$IsccPath = ''
 )
 
@@ -26,12 +26,12 @@ try {
 
     # A separate payload prevents overwriting a portable copy currently in use.
     $payloadRoot = Join-Path $PSScriptRoot 'build\installer-payload'
-    Write-Output '第一步：构建程序和任务栏扩展…'
+    Write-Output '第一步：构建程序…'
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build.ps1') -DistPath $payloadRoot
     if ($LASTEXITCODE -ne 0) { throw '程序构建失败，未生成新的安装包。' }
 
     $payload = Join-Path $payloadRoot 'aifuel'
-    foreach ($required in @('aifuel.exe', '_internal\taskbar_runtime\runtime-id.txt', '_internal\taskbar_runtime\Source\COPYING')) {
+    foreach ($required in @('aifuel.exe', '_internal\aifuel.ico')) {
         if (-not (Test-Path -LiteralPath (Join-Path $payload $required) -PathType Leaf)) {
             throw "打包产物不完整，缺少：$required"
         }

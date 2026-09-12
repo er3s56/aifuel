@@ -10,8 +10,11 @@ shell:startup 里看得见也能自己删、且杀软对它最不敏感。
 from __future__ import annotations
 
 import os
-import subprocess
+import ctypes as c
+from ctypes import wintypes as wt
+from contextlib import contextmanager
 import sys
+import uuid
 
 LINK_NAME = "aifuel.lnk"
 
@@ -48,40 +51,68 @@ def is_enabled() -> bool:
     return os.path.isfile(link_path())
 
 
-def _ps_quote(s: str) -> str:
-    """PowerShell 单引号字符串的转义：内部单引号写成两个。"""
-    return s.replace("'", "''")
+class _Guid(c.Structure):
+    _fields_ = [("bytes", c.c_ubyte * 16)]
+
+    def __init__(self, value):
+        super().__init__((c.c_ubyte * 16).from_buffer_copy(uuid.UUID(value).bytes_le))
+
+
+def _com_method(pointer, index, args, *values):
+    table = c.cast(pointer, c.POINTER(c.POINTER(c.c_void_p))).contents
+    result = c.WINFUNCTYPE(c.c_long, c.c_void_p, *args)(table[index])(pointer, *values)
+    if result < 0:
+        raise OSError("Shortcut COM failure: 0x%08x" % (result & 0xffffffff))
+
+
+@contextmanager
+def _shell_link():
+    ole = c.WinDLL("ole32")
+    ole.CoInitializeEx.argtypes, ole.CoInitializeEx.restype = [c.c_void_p, wt.DWORD], c.c_long
+    ole.CoCreateInstance.argtypes = [c.POINTER(_Guid), c.c_void_p, wt.DWORD,
+                                    c.POINTER(_Guid), c.POINTER(c.c_void_p)]
+    ole.CoCreateInstance.restype = c.c_long
+    initialized = ole.CoInitializeEx(None, 2)
+    if initialized < 0 and (initialized & 0xffffffff) != 0x80010106:  # RPC_E_CHANGED_MODE
+        raise OSError("Cannot initialize shortcut COM")
+    shell, persist = c.c_void_p(), c.c_void_p()
+    try:
+        hr = ole.CoCreateInstance(_Guid("00021401-0000-0000-c000-000000000046"), None, 1,
+                                  _Guid("000214f9-0000-0000-c000-000000000046"), c.byref(shell))
+        if hr < 0:
+            raise OSError("Cannot create Unicode shell link: 0x%08x" % (hr & 0xffffffff))
+        _com_method(shell, 0, [c.POINTER(_Guid), c.POINTER(c.c_void_p)],
+                    _Guid("0000010b-0000-0000-c000-000000000046"), c.byref(persist))
+        yield shell, persist
+    finally:
+        if persist:
+            _com_method(persist, 2, [])
+        if shell:
+            _com_method(shell, 2, [])
+        if initialized >= 0:
+            ole.CoUninitialize()
 
 
 def _make_shortcut(link: str, tgt: str, workdir: str, icon: str = "") -> None:
-    """建快捷方式，走 PowerShell 的 WScript.Shell COM。
+    """Use IShellLinkW directly: paths stay Unicode data, never shell code.
 
-    不用 pywin32：它能省下一次进程启动，但会让源码模式和 exe 模式走不同代码
-    （exe 里 pywin32 要么额外打进 7.7MB、要么缺失走兜底），等于总有一条路径
-    没被真正测过。切换自启是个罕见的用户动作，多花一秒无所谓。
-    PowerShell 在 Win10/11 上一定存在。
+    ctypes is bundled with Python; source and packaged builds use the same API.
     """
     if tgt.lower().endswith(".vbs"):
         # VBS 用 wscript 拉起（且不弹控制台）；Python 脚本不能交给 wscript。
-        ps_target = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+        target_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
                                  "System32", "wscript.exe")
-        ps_args = '"%s"' % tgt
+        arguments = '"%s"' % tgt
     else:
-        ps_target, ps_args = tgt, ""
-
-    script = (
-        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
-        "$s.TargetPath='%s';$s.Arguments='%s';$s.WorkingDirectory='%s';"
-        "$s.WindowStyle=7;%s$s.Save()"
-    ) % (_ps_quote(link), _ps_quote(ps_target), _ps_quote(ps_args),
-         _ps_quote(workdir),
-         ("$s.IconLocation='%s';" % _ps_quote(icon)) if icon else "")
-
-    subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        check=True, capture_output=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+        target_path, arguments = tgt, ""
+    with _shell_link() as (shell, persist):
+        _com_method(shell, 20, [wt.LPCWSTR], target_path)  # SetPath
+        _com_method(shell, 9, [wt.LPCWSTR], workdir)
+        _com_method(shell, 11, [wt.LPCWSTR], arguments)
+        _com_method(shell, 15, [c.c_int], 7)  # SW_SHOWMINNOACTIVE
+        if icon:
+            _com_method(shell, 17, [wt.LPCWSTR, c.c_int], icon, 0)
+        _com_method(persist, 6, [wt.LPCWSTR, wt.BOOL], link, True)
 
 
 def enable(frontend: str = "qt") -> "tuple[bool, str]":
@@ -109,6 +140,33 @@ def disable() -> "tuple[bool, str]":
     except Exception as e:
         return False, "删除快捷方式失败：%s" % e
     return not is_enabled(), "已关闭开机自启"
+
+
+def _read_shortcut(link: str) -> tuple[str, str]:
+    with _shell_link() as (shell, persist):
+        _com_method(persist, 5, [wt.LPCWSTR, wt.DWORD], link, 0)
+        path, arguments = c.create_unicode_buffer(32768), c.create_unicode_buffer(32768)
+        _com_method(shell, 3, [wt.LPWSTR, c.c_int, c.c_void_p, wt.DWORD],
+                    path, len(path), None, 4)
+        _com_method(shell, 10, [wt.LPWSTR, c.c_int], arguments, len(arguments))
+        return path.value, arguments.value
+
+
+def migrate_existing() -> tuple[bool, str]:
+    """Installer-only migration: preserve disabled startup and unrelated links."""
+    if not is_enabled():
+        return True, "未启用自启，保持关闭"
+    try:
+        previous, arguments = _read_shortcut(link_path())
+        name = os.path.basename(previous).lower()
+        owned = name in ("aifuel.exe", "aifuel_debug.exe")
+        if name == "wscript.exe":
+            owned = os.path.basename(arguments.strip('"')).lower() in ("run_qt.vbs", "run_tk.vbs")
+        if not owned:
+            return True, "保留其他程序的快捷方式"
+        return enable()
+    except Exception as error:
+        return False, "迁移自启失败：%s" % error
 
 
 if __name__ == "__main__":

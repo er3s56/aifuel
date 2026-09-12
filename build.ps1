@@ -31,7 +31,7 @@ $excludes = @(
   "PySide6.QtXml", "PySide6.QtConcurrent", "PySide6.QtHelp", "PySide6.QtUiTools",
   "PySide6.QtDesigner", "PySide6.QtCharts", "PySide6.QtMultimedia",
   "tkinter", "unittest", "pydoc", "doctest", "pdb", "PIL",
-  # autostart.py 刻意走 PowerShell 而不是 pywin32：少 7.7MB，且源码模式和
+  # autostart.py 使用 ctypes 而不是 pywin32：少 7.7MB，且源码模式和
   # exe 模式走同一条代码路径（否则总有一条没被真正测过）。
   "win32com", "win32comext", "pythoncom", "pywintypes", "win32api", "win32gui"
 )
@@ -43,14 +43,11 @@ $args = @(
   "--name", $name,
   "--distpath", $DistPath,
   "--icon", "aifuel.ico",
-  "--add-data", "build\taskbar-runtime;taskbar_runtime",
+  "--add-data", "aifuel.ico;.",
   "--log-level", "WARN"
 )
 foreach ($e in $excludes) { $args += @("--exclude-module", $e) }
 $args += "widget_qt.py"
-
-& $py native/build_runtime.py
-if ($LASTEXITCODE -ne 0) { Write-Output "任务栏扩展构建失败"; exit 1 }
 
 Write-Output "开始构建…"
 # PyInstaller 会沿 PATH 查 DLL。Poppler 等工具的 icuuc.dll 与 Windows 同名，

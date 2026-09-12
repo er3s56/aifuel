@@ -14,6 +14,9 @@
 #ifndef InstallerName
   #define InstallerName "AI Fuel"
 #endif
+#ifndef InstallerStartupLinkName
+  #define InstallerStartupLinkName "aifuel.lnk"
+#endif
 
 [Setup]
 AppId={#InstallerAppId}
@@ -55,25 +58,32 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 Name: "{group}\{#InstallerName}"; Filename: "{app}\aifuel.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#InstallerName}"; Filename: "{app}\aifuel.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
+[InstallDelete]
+; Retired payload owned by older AI Fuel installers; preserve user configuration.
+Type: filesandordirs; Name: "{app}\_internal\taskbar_runtime"
+
 [Run]
+Filename: "{app}\aifuel.exe"; Parameters: "--autostart migrate ""{#InstallerStartupLinkName}"""; WorkingDir: "{app}"; Flags: runhidden
 Filename: "{app}\aifuel.exe"; Description: "{cm:LaunchProgram,{#InstallerName}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Shell, Shortcut: Variant;
+  Shell, Folder, Shortcut: Variant;
   LinkPath, Target: String;
 begin
   if CurUninstallStep <> usUninstall then
     Exit;
   { The app creates this link itself. Only remove a link owned by this install. }
-  LinkPath := ExpandConstant('{userstartup}\aifuel.lnk');
+  LinkPath := ExpandConstant('{userstartup}\{#InstallerStartupLinkName}');
   if not FileExists(LinkPath) then
     Exit;
   try
-    Shell := CreateOleObject('WScript.Shell');
-    Shortcut := Shell.CreateShortcut(LinkPath);
-    Target := Shortcut.TargetPath;
+    { WScript.Shell loses characters outside the system ANSI code page. }
+    Shell := CreateOleObject('Shell.Application');
+    Folder := Shell.NameSpace(ExtractFileDir(LinkPath));
+    Shortcut := Folder.ParseName(ExtractFileName(LinkPath));
+    Target := Shortcut.ExtendedProperty('System.Link.TargetParsingPath');
     if CompareText(Target, ExpandConstant('{app}\aifuel.exe')) = 0 then
       if not DeleteFile(LinkPath) then
         Log('Could not remove the startup shortcut.');

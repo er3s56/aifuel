@@ -217,7 +217,9 @@ def _query_provider(provider, fetch, timeout, min_interval=0):
                 error = QueryError("额度响应格式异常或缺少有效额度字段", "invalid")
             else:
                 error = QueryError("账户额度查询失败，请检查网络后重试")
-            state.fail(error, stamp, time.time())
+            # The official CLI may have renewed credentials during fetch().
+            # Record the failed attempt's final credentials, not its initial ones.
+            state.fail(error, _credential_stamp(provider), time.time())
             return _fallback(provider, state)
         state.clear()
         now = time.time()

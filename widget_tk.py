@@ -15,6 +15,7 @@ from tkinter import messagebox
 import autostart
 import display
 import sources
+from window_position import visible_position, windows_work_areas
 
 CONFIG = os.path.join(sources.data_dir(), "config_tk.json")
 
@@ -58,6 +59,8 @@ class QuotaWidget:
         x = self.cfg.get("x", self.root.winfo_screenwidth() - W - 24)
         y = self.cfg.get("y", 48)
         h0 = TOP * 2 + MIN_ROWS * ROW_H
+        areas = windows_work_areas() or [(0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())]
+        x, y = visible_position(x, y, W, h0, areas)
         self.root.geometry("%dx%d+%d+%d" % (W, h0, x, y))
 
         self.canvas = tk.Canvas(self.root, width=W, height=h0, bg=display.BG,
@@ -97,7 +100,11 @@ class QuotaWidget:
         save_config(self.cfg)
 
     def _menu(self, e):
+        previous = getattr(self, "_context_menu", None)
+        if previous is not None:
+            previous.destroy()
         m = tk.Menu(self.root, tearoff=0)
+        self._context_menu = m
         m.add_command(label="立即刷新", command=self.refresh)
         m.add_command(label="额度详情（百分比为已用）", command=lambda: messagebox.showinfo(
             "额度详情", display.details(self.readings), parent=self.root))

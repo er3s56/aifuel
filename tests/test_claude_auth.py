@@ -193,3 +193,30 @@ class ClaudeAuthTests(IsolatedTest):
         self.assertEqual(caught.exception.kind, 'auth')
         self.assertEqual(query.call_count, 2)
         self.launch.assert_called_once()
+
+    def test_failed_renewal_does_not_cancel_auth_backoff_but_user_login_does(self):
+        stamp = [0]
+        renewals = []
+        def token(*args, **kwargs):
+            if kwargs.get('rejected_token') is not None:
+                stamp[0] += 1
+                renewals.append(stamp[0])
+            return 'test-token-' + str(stamp[0])
+        with patch.object(sources, '_retry_states', {'claude': RetryState()}), \
+                patch.object(sources, '_credential_stamp', side_effect=lambda _: stamp[0]), \
+                patch.object(sources, '_fallback', return_value=[]), \
+                patch.object(sources, 'data_dir', return_value='unused'), \
+                patch.object(sources.claude_auth, 'access_token', side_effect=token), \
+                patch.object(sources, '_request_claude_usage', side_effect=QueryError('401', 'auth')) as request:
+            for t in range(0, 151, 30):
+                with patch.object(sources.time, 'time', return_value=1000+t):
+                    sources.read_claude()
+            self.assertEqual(len(renewals), 1)
+            self.assertEqual(request.call_count, 2)
+            with patch.object(sources.time, 'time', return_value=1300):
+                sources.read_claude()
+            self.assertEqual(request.call_count, 4)
+            stamp[0] += 1  # An actual later login still clears the auth wait.
+            with patch.object(sources.time, 'time', return_value=1301):
+                sources.read_claude()
+            self.assertEqual(request.call_count, 6)

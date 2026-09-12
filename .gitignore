@@ -12,6 +12,7 @@ venv/
 
 # 生成的图标（build.ps1 会自动重建）
 aifuel.ico
+icon_preview.png
 
 # 运行时状态实际在 %LOCALAPPDATA%\aifuel\，这些是早期版本留在项目里的残留
 .cache.json

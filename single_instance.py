@@ -44,9 +44,9 @@ def acquire(name="aifuel_widget", timeout=90.0):
         raise ctypes.WinError(error)
     try:
         deadline = time.monotonic() + timeout
-        if existed and api.WaitForSingleObject(closing, 0) == 0:
+        if existed:
             api.SetEvent(reopen)
-        # Normal duplicate launches still exit immediately. During shutdown keep
+        # Normal duplicate launches restore the existing window and exit. During shutdown keep
         # the launch alive, but do not start a second set of quota requests.
         while not acquired and api.WaitForSingleObject(closing, 0) == 0:
             remaining = deadline - time.monotonic()
