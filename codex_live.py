@@ -58,6 +58,26 @@ def _executable_path(path: str) -> str | None:
     return path if stat.S_ISREG(info.st_mode) else None
 
 
+def _desktop_codex(local: str) -> str | None:
+    """Reuse the native CLI prepared by the Windows desktop app.
+
+    WindowsApps resources aren't directly executable in every install. The app
+    prepares its executable in this versioned cache when starting native Codex.
+    Rediscover on process startup so desktop upgrades don't pin a deleted path.
+    """
+    candidates = []
+    try:
+        for path in (Path(local) / "OpenAI" / "Codex" / "bin").glob("*/codex.exe"):
+            if resolved := _executable_path(str(path)):
+                try:
+                    candidates.append((os.stat(resolved).st_mtime_ns, resolved))
+                except OSError:
+                    continue  # An update may remove an old cache during discovery.
+    except OSError:
+        pass
+    return max(candidates)[1] if candidates else None
+
+
 def find_codex() -> str:
     override = os.environ.get("AIFUEL_CODEX_EXE")
     if override:
@@ -79,7 +99,10 @@ def find_codex() -> str:
         for candidate in candidates:
             if resolved := _executable_path(candidate):
                 return resolved
-    raise QueryError("暂未找到 Codex 查询组件，正在自动重新检查安装位置", "dependency")
+        if local and (resolved := _desktop_codex(local)):
+            return resolved
+    raise QueryError("未找到 Codex 查询组件。请先打开桌面端的 Codex 模式；"
+                     "若仍无法识别，可安装 Codex CLI。", "dependency")
 
 
 class CodexLiveError(QueryError):
@@ -211,7 +234,7 @@ class CodexClient:
                     self._reader.start()
                     self._phase = "initialize"
                     self._request("initialize", {"clientInfo": {
-                        "name": "aifuel", "title": "aifuel", "version": "0.2.1"}}, deadline)
+                        "name": "aifuel", "title": "aifuel", "version": "0.2.3"}}, deadline)
                     self._send({"method": "initialized", "params": {}})
                 self._phase = "read_account"
                 account = self._request("account/read", {"refreshToken": False}, deadline).get("account")

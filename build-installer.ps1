@@ -1,7 +1,7 @@
 ﻿# Build the application and then its per-user Windows installer.
 param(
     [ValidatePattern('^\d{1,4}\.\d{1,4}\.\d{1,4}$')]
-    [string]$Version = '0.2.1',
+    [string]$Version = '0.2.3',
     [string]$IsccPath = ''
 )
 

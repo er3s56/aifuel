@@ -20,7 +20,11 @@ def live_payload(percent):
         "secondary": None}}}
 
 
-class DiscoveryTests(unittest.TestCase):
+class DiscoveryTests(IsolatedTest):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(patch.dict(os.environ, {"LOCALAPPDATA": str(self.state)}))
+
     def test_removed_override_falls_back_to_installed_cli(self):
         with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": "removed/codex.exe"}), \
                 patch.object(codex_live, "_executable_path", return_value=None), \
@@ -34,6 +38,48 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(codex_live.QueryError) as failure:
                 codex_live.find_codex()
             self.assertEqual(failure.exception.kind, "dependency")
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows desktop component")
+    def test_desktop_only_install_and_upgrade_are_discovered_without_cli_on_path(self):
+        root = self.state / "OpenAI" / "Codex" / "bin"
+        with patch.dict(os.environ, {"PATH": "", "AIFUEL_CODEX_EXE": ""}):
+            with self.assertRaises(codex_live.QueryError):
+                codex_live.find_codex()
+            old = root / "old-version" / "codex.exe"
+            old.parent.mkdir(parents=True)
+            old.write_bytes(b"old desktop CLI")
+            os.utime(old, (1000, 1000))
+            self.assertEqual(codex_live.find_codex(), str(old))
+            new = root / "new-version" / "codex.exe"
+            new.parent.mkdir()
+            new.write_bytes(b"updated desktop CLI")
+            os.utime(new, (2000, 2000))
+            self.assertEqual(codex_live.find_codex(), str(new))
+            old.unlink()
+            self.assertEqual(codex_live.find_codex(), str(new))
+            # An explicit executable continues to take precedence over the desktop.
+            with patch.dict(os.environ, {"AIFUEL_CODEX_EXE": sys.executable}):
+                self.assertEqual(codex_live.find_codex(), sys.executable)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows desktop component")
+    def test_incomplete_or_disappearing_desktop_cache_does_not_hide_valid_candidate(self):
+        root = self.state / "OpenAI" / "Codex" / "bin"
+        valid = root / "valid" / "codex.exe"
+        valid.parent.mkdir(parents=True)
+        valid.write_bytes(b"desktop CLI")
+        invalid = root / "incomplete" / "codex.exe"
+        invalid.mkdir(parents=True)  # A directory isn't an executable.
+        vanished = root / "vanished" / "codex.exe"
+        vanished.parent.mkdir()
+        vanished.touch()
+        real_stat = os.stat
+        def stat(path, *args, **kwargs):
+            if str(path) == str(vanished):
+                raise FileNotFoundError(str(path))
+            return real_stat(path, *args, **kwargs)
+        with patch.dict(os.environ, {"PATH": "", "AIFUEL_CODEX_EXE": ""}), \
+                patch.object(codex_live.os, "stat", side_effect=stat):
+            self.assertEqual(codex_live.find_codex(), str(valid))
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows launcher junctions")

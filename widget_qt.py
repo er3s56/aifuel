@@ -431,20 +431,21 @@ class QuotaWidget(QWidget):
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "--diagnose-codex":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--diagnose-codex", "--diagnose-claude"):
         # Match the GUI's Qt initialization and background-thread query path.
         from dataclasses import asdict
+        provider = sys.argv[1].removeprefix("--diagnose-")
         app = QApplication([])
         class DiagnosticWorker(QThread):
             def run(self):
-                self.readings = sources.read_codex()
+                self.readings = sources.read_claude() if provider == "claude" else sources.read_codex()
         worker = DiagnosticWorker()
         worker.finished.connect(app.quit)
         worker.start()
         app.exec()
         worker.wait()
         readings = worker.readings
-        report = os.path.join(sources.data_dir(), "codex-report.json")
+        report = os.path.join(sources.data_dir(), provider + "-report.json")
         with open(report, "w", encoding="utf-8") as f:
             json.dump([asdict(r) for r in readings], f, ensure_ascii=False, indent=2)
         sys.exit(0 if readings and all(not r.stale and not r.error for r in readings) else 1)

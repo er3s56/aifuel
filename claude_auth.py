@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 
+import claude_desktop
 from quota_policy import QueryError
 
 
@@ -56,7 +57,24 @@ def find_claude():
     installed = os.path.join(os.path.expanduser("~"), ".local", "bin", executable)
     if os.path.isfile(installed):
         return installed
-    raise QueryError("自动续期需要 Claude Code，请安装或设置 AIFUEL_CLAUDE_EXE", "setup")
+    desktop = claude_desktop.find_cli()
+    if desktop:
+        return desktop
+    raise QueryError("未找到 Claude 续期组件；请打开桌面端的 Code 模式，或安装 Claude Code CLI", "dependency")
+
+
+def uses_desktop(path):
+    if sys.platform != "win32" or os.environ.get("CLAUDE_CONFIG_DIR"):
+        return False
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        pass
+    # Existing CLI credentials, including expired/unreadable ones, keep their
+    # account identity. Never silently switch those users to a desktop account.
+    return False
 
 
 def _command():
@@ -134,6 +152,8 @@ def _refresh(path, state_dir, rejected_token, timeout):
 
 
 def access_token(path, state_dir, rejected_token=None, timeout=REFRESH_TIMEOUT):
+    if uses_desktop(path):
+        return claude_desktop.access_token(rejected_token)
     current = _read(path)
     if current.usable(rejected_token):
         return current.token

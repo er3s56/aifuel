@@ -23,10 +23,14 @@ Claude 的额度类型不做白名单；GPT 显示 Codex 主额度及启用的�
 | `run_qt.vbs` | Python + PySide6 | 开发时用，改完代码直接跑 |
 | `run_tk.vbs` | Python（tkinter 自带） | 零依赖备选，外观朴素些 |
 
-> **前提**：机器上得装了 Claude Code / Codex 并登录过。exe 打包的是程序，
-> 不是你的账号——读不到 `~/.claude` 和 `~/.codex` 就只会显示 `--`。
-> GPT 实时查询还需要可运行的 Codex CLI。默认查找 PATH 和 Windows 安装器目录；
-> 非标准安装可用 `AIFUEL_CODEX_EXE` 指定可执行文件路径。
+> **前提**：仅需安装、登录要查询的对应客户端，两家互不依赖。
+> Claude 可使用 Windows Claude 桌面端的 Code 登录，或独立 Claude Code CLI 登录；
+> GPT 可使用 Windows 桌面端或独立 Codex CLI。
+> 只装桌面端时，请先打开对应的 Code / Codex 模式并登录。
+> 默认查找 PATH、独立 CLI 安装目录和桌面端组件缓存；缺少组件时显示“组件未就绪”，
+> 右键“额度详情”可查看处理方法。非标准安装可用 `AIFUEL_CODEX_EXE` 或
+> `AIFUEL_CLAUDE_EXE` 指定对应的命令行组件路径（不是桌面端主程序）。
+> 安装包不包含账号登录；仅登录网页不能为 AI Fuel 提供本地查询组件。
 
 安装后自动启动时，Windows 的目录链接保护可能让 Codex 启动路径报 448。
 AI Fuel 会读取启动链接并查找当前版本的实际程序文件，保持系统保护开启，
@@ -60,7 +64,8 @@ Tk 版保留基本悬浮窗，不提供托盘入口和锁定功能。
 缓存原因；Qt 版悬停也会显示详情。
 
 查询失败时，五分钟以内的账户缓存显示 `⟳`，右侧显示“缓存”“限流等待”或授权状态。
-Claude 访问凭证过期会后台自动续期；授权无法恢复时显示“需授权”，GPT 未登录时显示“需登录”。
+Claude CLI 访问凭证过期会后台自动续期；桌面端授权由 Claude 桌面端续期，
+过期时提示打开 Code 模式，检测到授权更新后自动恢复。授权无法恢复时显示“需授权”，GPT 未登录时显示“需登录”。
 **距最后成功查询达到 5 分钟，或额度窗口已重置，主面板就显示 `--`**；旧数值只留在
 详情里并注明“不代表当前额度”。这个期限包含程序关闭的时间，重启或手动刷新不会
 把旧缓存变新。前端每秒检查有效期，重试等待期间也会按时隐藏过期值。
@@ -89,7 +94,7 @@ VBS 启动器。旧版 Tk 曾错误地指向 Qt；若之前已启用，取消勾
 **Claude** —— 调 `https://api.anthropic.com/api/oauth/usage`，就是 `/usage` 命令
 背后那个接口，拿的是官方真实百分比（`session` 和 `weekly_all`）。
 
-访问凭证过期时，aifuel 会启动隐藏的官方 Claude Code CLI，通过初始化流程自动续期，
+使用 CLI 登录且访问凭证过期时，aifuel 会启动隐藏的官方 Claude Code CLI，通过初始化流程自动续期，
 完成后继续查额度。遇到 401 时也会尝试一次官方恢复流程，再查询账户接口。
 普通过期无需手动登录或重启；网络失败按退避规则自动重试，只有授权被撤销或无法续期时
 才提示“需授权”。临时缓存继续遵守五分钟有效期，Claude 的正常查询间隔仍为两分钟。
@@ -97,8 +102,18 @@ VBS 启动器。旧版 Tk 曾错误地指向 Qt；若之前已启用，取消勾
 凭证文件由 aifuel **只读**，续期的写入、轮换和跨进程锁均交给官方 CLI，避免与其他
 Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发送聊天或模型请求，
 关闭工具、MCP、用户钩子和会话保存，完成或超时后退出。
-凭证路径支持 `CLAUDE_CONFIG_DIR`；助手从 PATH 或 `~/.local/bin` 找到 `claude`，
-也可用 `AIFUEL_CLAUDE_EXE` 指定安装位置。已在 Claude Code 2.1.233 上验证自动续期。
+凭证路径支持 `CLAUDE_CONFIG_DIR`；助手从 PATH、`~/.local/bin` 或 Windows Claude
+桌面端的版本化组件目录找到 `claude`，也可用 `AIFUEL_CLAUDE_EXE` 指定安装位置。
+已在 Claude Code 2.1.233 上验证自动续期。
+
+Windows 上没有 CLI 凭证且未指定 `CLAUDE_CONFIG_DIR` 时，使用 Claude 桌面端已保存
+的 Code 授权，兼容普通安装和 MSIX 安装的数据目录。通过 Windows DPAPI / CNG
+读取桌面端的加密 OAuth 存储，仅在内存中用于额度请求；不读取浏览器 Cookie，
+不复制或写入凭证，不替桌面端轮换 refresh token。桌面端授权过期或尚未生成时，
+请打开 Claude 的 Code 模式；授权更新后自动恢复，不必重启 AI Fuel。
+已有 CLI 凭证时继续使用该账户，不会因过期而切换到桌面端的另一个账户。
+桌面端存在多个组织且无法确定目标时会明确提示使用 CLI 登录目标账户。
+已在 Claude Desktop 1.52386.3.0 / 内置 Claude Code 2.1.266 上验证桌面端登录查询。
 
 **ChatGPT/Codex** —— 通过已登录的 `codex app-server`，每轮调用官方
 [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt)
@@ -113,6 +128,8 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 > 下次尝试时间，以及已经过期的历史读数。
 > `aifuel.exe --diagnose-codex` 不开窗口查询一次，将结果写到运行目录的
 > `codex-report.json`；退出码 0 表示实时成功，1 表示使用缓存或查询失败。
+> Claude 可使用 `aifuel.exe --diagnose-claude`，结果写入 `claude-report.json`；
+> 两种报告仅包含额度和状态，不包含登录凭证。
 
 ## 标记含义
 
@@ -148,6 +165,8 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 | `quota_policy.py` | 共用失败分类、缓存有效期和重试策略 |
 | `codex_live.py` | Codex 账户查询与隐藏辅助进程 |
 | `claude_auth.py` | Claude 官方 CLI 自动续期与后台助手清理 |
+| `claude_desktop.py` | Windows Claude 桌面端组件发现与授权读取 |
+| `windows_crypto.py` | 调用 Windows DPAPI / CNG 读取加密数据 |
 | `display.py` | 显示决策：什么数字、什么颜色、要不要压暗。两版共用 |
 | `widget_qt.py` / `widget_tk.py` | 两个前端 |
 | `window_position.py` | 多屏位置恢复 |
@@ -166,7 +185,7 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 双击项目根目录的 **`build-installer.cmd`**。窗口会保留构建结果，不需要记住
 PowerShell 命令或永久修改执行策略。Python 和依赖仍需与下方便携版构建环境一致。
 
-产物在 `dist\installer\AI-Fuel-0.2.1-windows-x64-setup.exe`，旁边的 `.sha256`
+产物在 `dist\installer\AI-Fuel-0.2.3-windows-x64-setup.exe`，旁边的 `.sha256`
 文件用于校验。发布时只需分发这个安装包，用户无需 Python、编译器或 PowerShell 操作。
 指定版本可运行 `build-installer.cmd -Version 0.2.0`；自定义编译器位置使用
 `-IsccPath "C:\工具目录\ISCC.exe"`。

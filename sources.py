@@ -24,6 +24,7 @@ from typing import Optional
 
 from codex_live import CodexClient
 import claude_auth
+import claude_desktop
 from quota_policy import CLAUDE_POLL_INTERVAL, QueryError, RetryState, retry_after_seconds
 
 HOME = os.path.expanduser("~")
@@ -138,6 +139,8 @@ def _from_cache(key: str) -> "list[Reading]":
 
 
 def _credential_stamp(provider):
+    if provider == "claude" and claude_auth.uses_desktop(CLAUDE_CREDS):
+        return claude_desktop.credential_stamp()
     path = CLAUDE_CREDS if provider == "claude" else os.path.join(
         os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "auth.json")
     try:

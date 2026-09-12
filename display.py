@@ -130,7 +130,7 @@ def status_text(reading: Reading) -> str:
     if reading.failure_kind == "rate_limit":
         return "限流等待"
     if reading.failure_kind == "dependency":
-        return "查询重试"
+        return "组件未就绪"
     if reading.error:
         return "查询失败"
     if window_expired(reading):

@@ -25,7 +25,7 @@ class FailurePolicyTests(IsolatedTest):
             self.clock.return_value = now
             reading = sources.read_codex()[0]
             self.assertEqual(reading.retry_at, now + 30)
-            self.assertEqual(display.status_text(reading), "查询重试")
+            self.assertEqual(display.status_text(reading), "组件未就绪")
             self.assertEqual(reading.observed_at, first.observed_at)
         self.codex.side_effect = None
         self.clock.return_value += 30
