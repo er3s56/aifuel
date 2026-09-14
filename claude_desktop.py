@@ -110,11 +110,13 @@ def _decrypt_cache(config, root):
     return entries
 
 
-def _select_token(entries, account, rejected_token=None):
+def _select_token(entries, account, rejected_token=None, required_identity=None):
     if account is not None and (not isinstance(account, str) or not account):
         raise ValueError("Invalid desktop account")
     candidates, organizations = [], set()
     scoped = any(key.startswith("acct:") for key in entries)
+    if required_identity is not None and (not scoped or account != required_identity[0]):
+        raise QueryError("无法确认 Claude 桌面端与 CLI 属于同一账户，保留原有授权来源", "auth")
     for cache_key, entry in entries.items():
         if scoped:
             if not account or not cache_key.startswith("acct:" + account + "|"):
@@ -125,6 +127,8 @@ def _select_token(entries, account, rejected_token=None):
             continue
         parts = identity.split(":")
         if len(parts) != 2 or not all(parts) or not isinstance(entry, dict):
+            continue
+        if required_identity is not None and parts[1] != required_identity[1]:
             continue
         token, expiry = entry.get("token"), entry.get("expiresAt")
         if (not isinstance(token, str) or not token or isinstance(expiry, bool)
@@ -140,7 +144,7 @@ def _select_token(entries, account, rejected_token=None):
     return max(candidates)[2]
 
 
-def access_token(rejected_token=None):
+def access_token(rejected_token=None, *, required_identity=None):
     path = _config_path()
     if path is None:
         raise QueryError("未找到 Claude 登录信息；请登录 Claude Code CLI，或打开 Claude 桌面端的 Code 模式并登录", "auth")
@@ -149,7 +153,7 @@ def access_token(rejected_token=None):
         if not any(config.get(k) for k in _CACHE_NAMES):
             raise QueryError("未找到 Claude 桌面端的 Code 授权；" + _SIGN_IN, "auth")
         entries = _decrypt_cache(config, path.parent)
-        return _select_token(entries, config.get("lastKnownAccountUuid"), rejected_token)
+        return _select_token(entries, config.get("lastKnownAccountUuid"), rejected_token, required_identity)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         # Never include Windows errors, decrypted content, or account identifiers.
         raise QueryError("无法读取 Claude 桌面端授权；请更新并打开桌面端的 Code 模式重试，也可使用 Claude Code CLI 登录", "auth") from None

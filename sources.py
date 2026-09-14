@@ -145,9 +145,14 @@ def _credential_stamp(provider):
         os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "auth.json")
     try:
         with open(path, "rb") as stream:
-            return hashlib.sha256(stream.read()).digest()
+            stamp = hashlib.sha256(stream.read()).digest()
     except OSError:
-        return None
+        stamp = None
+    if provider == "claude":
+        identity = claude_auth.desktop_fallback_identity(path)
+        if identity is not None:
+            return stamp, identity, claude_desktop.credential_stamp()
+    return stamp
 
 
 def _validate_readings(readings):

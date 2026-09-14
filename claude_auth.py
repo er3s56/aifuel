@@ -72,9 +72,26 @@ def uses_desktop(path):
         return True
     except OSError:
         pass
-    # Existing CLI credentials, including expired/unreadable ones, keep their
-    # account identity. Never silently switch those users to a desktop account.
+    # Existing CLI credentials keep priority. Recovery from Desktop separately
+    # requires the CLI's recorded account and organization to match.
     return False
+
+
+def desktop_fallback_identity(path):
+    """Return the default CLI's account/org, never infer identity from expiry."""
+    if sys.platform != "win32" or os.environ.get("CLAUDE_CONFIG_DIR"):
+        return None
+    home = os.path.expanduser("~")
+    default = os.path.join(home, ".claude", ".credentials.json")
+    if os.path.normcase(os.path.abspath(path)) != os.path.normcase(default):
+        return None
+    try:
+        with open(os.path.join(home, ".claude.json"), encoding="utf-8") as stream:
+            account = json.load(stream)["oauthAccount"]
+        identity = (account.get("accountUuid"), account.get("organizationUuid"))
+        return identity if all(isinstance(value, str) and value for value in identity) else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def _command():
@@ -151,9 +168,7 @@ def _refresh(path, state_dir, rejected_token, timeout):
         _stop(process)
 
 
-def access_token(path, state_dir, rejected_token=None, timeout=REFRESH_TIMEOUT):
-    if uses_desktop(path):
-        return claude_desktop.access_token(rejected_token)
+def _cli_access_token(path, state_dir, rejected_token, timeout):
     current = _read(path)
     if current.usable(rejected_token):
         return current.token
@@ -171,3 +186,18 @@ def access_token(path, state_dir, rejected_token=None, timeout=REFRESH_TIMEOUT):
         if not current.refreshable:
             raise QueryError("Claude 授权已失效，自动恢复失败，需要重新授权", "auth")
         raise QueryError("Claude 自动续期暂未完成，将稍后重试")
+
+
+def access_token(path, state_dir, rejected_token=None, timeout=REFRESH_TIMEOUT):
+    if uses_desktop(path):
+        return claude_desktop.access_token(rejected_token)
+    try:
+        return _cli_access_token(path, state_dir, rejected_token, timeout)
+    except QueryError:
+        identity = desktop_fallback_identity(path)
+        if identity is not None:
+            try:
+                return claude_desktop.access_token(rejected_token, required_identity=identity)
+            except QueryError:
+                pass  # Keep the CLI error when same-account recovery is unavailable.
+        raise

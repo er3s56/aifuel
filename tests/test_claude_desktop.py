@@ -40,6 +40,118 @@ class DesktopTests(IsolatedTest):
         data.update(changes)
         self.config.write_text(json.dumps(data), encoding="utf-8")
 
+    def cleared_cli(self, token="", expiry=0, refresh=""):
+        home = self.state / "home"
+        path = home / ".claude" / ".credentials.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": token, "refreshToken": refresh, "expiresAt": expiry}}), encoding="utf-8")
+        (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "accountUuid": "active", "organizationUuid": "org-one"}}), encoding="utf-8")
+        self.enterContext(patch.object(claude_auth.os.path, "expanduser", return_value=str(home)))
+        self.enterContext(patch.object(claude_auth.sys, "platform", "win32"))
+        return path
+
+    def test_cleared_cli_recovers_same_account_without_writing_credentials(self):
+        path = self.cleared_cli()
+        files = (path, self.config, path.parent.parent / ".claude.json")
+        original = [p.read_bytes() for p in files]
+        with patch.object(sources, "CLAUDE_CREDS", str(path)), \
+             patch.object(claude_auth, "_refresh") as refresh, \
+             patch.object(sources, "_request_claude_usage", return_value={
+                 "limits": [{"kind": "session", "percent": 27}]}) as query:
+            self.assertEqual(sources._fetch_claude(1)[0].percent, 27)
+        self.assertEqual(query.call_args.args[0], "test-desktop-token")
+        refresh.assert_not_called()
+        self.assertEqual(original, [p.read_bytes() for p in files])
+
+    def test_known_cli_account_keeps_valid_or_successfully_renewed_cli_token(self):
+        path = self.cleared_cli(token="cli-token", expiry=9000000)
+        self.assertEqual(claude_auth.access_token(str(path), str(self.state)), "cli-token")
+        path.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "expired", "expiresAt": 0, "refreshToken": "refresh"}}), encoding="utf-8")
+        def renew(*args):
+            path.write_text(json.dumps({"claudeAiOauth": {
+                "accessToken": "renewed-cli", "expiresAt": 9000000}}), encoding="utf-8")
+        with patch.object(claude_auth, "_refresh", side_effect=renew) as refresh:
+            self.assertEqual(claude_auth.access_token(str(path), str(self.state)), "renewed-cli")
+        refresh.assert_called_once()
+        self.decrypt.assert_not_called()
+
+    def test_failed_official_renewal_can_recover_same_account(self):
+        path = self.cleared_cli(refresh="refresh")
+        for kind in ("auth", "temporary", "dependency"):
+            with self.subTest(kind=kind), patch.object(claude_auth, "_refresh",
+                    side_effect=QueryError("official recovery failed", kind)) as refresh:
+                self.assertEqual(claude_auth.access_token(str(path), str(self.state)), "test-desktop-token")
+                refresh.assert_called_once()
+
+    def test_fallback_rejects_other_accounts_organizations_and_unscoped_cache(self):
+        path = self.cleared_cli()
+        for account, key in (("other", cache_key(account="other")),
+                             ("active", cache_key(org="other-org")),
+                             ("active", cache_key().split("|", 1)[1])):
+            with self.subTest(account=account, key=key):
+                self.write_config(lastKnownAccountUuid=account)
+                self.entries.clear()
+                self.entries[key] = entry()
+                with self.assertRaises(QueryError):
+                    claude_auth.access_token(str(path), str(self.state))
+
+    def test_fallback_can_select_recorded_org_among_multiple_orgs(self):
+        path = self.cleared_cli()
+        self.entries[cache_key(org="other-org")] = entry("other-org-token", 99000000)
+        self.assertEqual(claude_auth.access_token(str(path), str(self.state)), "test-desktop-token")
+
+    def test_fallback_requires_complete_cli_identity_and_default_config(self):
+        path = self.cleared_cli()
+        profile = path.parent.parent / ".claude.json"
+        with patch.dict(os.environ, CLAUDE_CONFIG_DIR=str(path.parent)), self.assertRaises(QueryError):
+            claude_auth.access_token(str(path), str(self.state))
+        custom = self.state / "custom.json"
+        custom.write_bytes(path.read_bytes())
+        with self.assertRaises(QueryError):
+            claude_auth.access_token(str(custom), str(self.state))
+        for identity in ({}, {"accountUuid": "active"}, {"organizationUuid": "org-one"},
+                         {"accountUuid": None, "organizationUuid": "org-one"}):
+            profile.write_text(json.dumps({"oauthAccount": identity}), encoding="utf-8")
+            with self.subTest(identity=identity), self.assertRaises(QueryError):
+                claude_auth.access_token(str(path), str(self.state))
+        self.decrypt.assert_not_called()
+
+    def test_rejected_fallback_token_is_not_sent_again(self):
+        path = self.cleared_cli()
+        with patch.object(sources, "CLAUDE_CREDS", str(path)), \
+             patch.object(sources, "_request_claude_usage", side_effect=QueryError("401", "auth")) as query, \
+             patch.object(claude_auth, "_refresh") as refresh, self.assertRaises(QueryError):
+            sources._fetch_claude(1)
+        query.assert_called_once()
+        refresh.assert_not_called()
+
+    def test_desktop_rotation_with_cleared_cli_ends_only_auth_cooldown(self):
+        path = self.cleared_cli()
+        self.entries[cache_key()] = entry(expiry=1000000)
+        with patch.object(sources, "CLAUDE_CREDS", str(path)), \
+             patch.object(sources, "CACHE_FILE", str(self.state / "quota.json")), \
+             patch.object(sources, "_retry_states", {"claude": RetryState()}), \
+             patch.object(sources, "_request_claude_usage", return_value={
+                 "limits": [{"kind": "session", "percent": 27}]}) as query:
+            first = sources.read_claude()[0]
+            self.assertEqual(first.failure_kind, "auth")
+            self.clock.return_value += 30
+            self.write_config(windowSize={"width": 202})
+            self.assertEqual(sources.read_claude()[0].retry_at, first.retry_at)
+            query.assert_not_called()
+            self.write_config(**{"oauth:tokenCacheV2": "rotated"})
+            self.entries[cache_key()] = entry("renewed")
+            self.assertFalse(sources.read_claude()[0].stale)
+            query.assert_called_once()
+            state = sources._retry_states["claude"]
+            state.fail(QueryError("429", "rate_limit", 120), sources._credential_stamp("claude"), 2030)
+            self.write_config(**{"oauth:tokenCacheV2": "rotated-again"})
+            self.assertEqual(sources.read_claude()[0].failure_kind, "rate_limit")
+            query.assert_called_once()
+
     def test_desktop_only_queries_live_usage_without_cli_or_credential_writes(self):
         before = self.config.read_bytes()
         with patch.object(claude_auth.sys, "platform", "win32"), \
