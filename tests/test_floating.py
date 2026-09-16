@@ -120,6 +120,86 @@ for action in opacity.actions():
         assert image.pixelColor(0, 0).alpha() == 0, 'Rounded corners became a solid rectangle'
 ''')
 
+    def test_layout_resize_refresh_and_restart_keep_preferences(self):
+        self.run_qt('''
+from PySide6.QtCore import QPoint
+def resize_to(width, height):
+    local = QPointF(w.width() - 2, w.height() - 2)
+    start = w.mapToGlobal(local.toPoint())
+    finish = start + QPoint(width - w.width(), height - w.height())
+    for kind, global_pos in ((QEvent.MouseButtonPress, start), (QEvent.MouseMove, finish),
+                             (QEvent.MouseButtonRelease, finish)):
+        app.sendEvent(w, QMouseEvent(kind, local, QPointF(global_pos), Qt.LeftButton,
+                                    Qt.LeftButton, Qt.NoModifier))
+    app.processEvents()
+layout = next(a.menu() for a in w._tray_menu.actions() if a.text() == '布局')
+layout.actions()[1].trigger()
+assert w.layout_mode == 'horizontal' and (w.width(), w.height()) == (600, 48)
+resize_to(1200, 28)
+assert (w.width(), w.height()) == (1200, 28)
+original = list(w.cfg['sizes']['horizontal'])
+for failure in ('', 'auth', 'rate_limit', 'dependency'):
+    w._apply([sources.Reading('claude', 'Fable', 100, stale=bool(failure),
+                             observed_at=time.time(), failure_kind=failure)] * 4, schedule=False)
+    assert (w.width(), w.height()) == (1200, 28), 'Status changed panel dimensions'
+    assert not w.grab().isNull()
+# A new limit must be visible, with user width preserved.
+w._apply(w.readings + [sources.Reading('chatgpt', '余额', None, text='$25.00')], schedule=False)
+assert w.width() == 1200 and w.height() == 48
+assert w.cfg['sizes']['horizontal'] == original
+w._apply(w.readings[:4], schedule=False)
+assert w.height() == 28
+layout.actions()[0].trigger()
+resize_to(390, 150)
+w._apply(w.readings, schedule=False)
+assert (w.width(), w.height()) == (390, 150)
+layout.actions()[1].trigger()
+assert (w.width(), w.height()) == (1200, 28)
+w._set_locked(True)
+resize_to(700, 70)
+assert (w.width(), w.height()) == (1200, 28)
+w._tray_menu.aboutToShow.emit()
+assert not layout.isEnabled()
+w._set_locked(False)
+w.close()
+w = widget_qt.QuotaWidget()
+drain(lambda: w._thread is None)
+w.timer.stop()
+w.show()
+assert w.layout_mode == 'horizontal' and (w.width(), w.height()) == (1200, 28)
+w._reset_size()
+assert (w.width(), w.height()) == (600, 48)
+w._set_layout('vertical')
+assert (w.width(), w.height()) == (390, 150)
+''')
+
+    def test_resize_edges_anchor_opposite_corner_and_preserve_taskbar_position(self):
+        self.run_qt('''
+from PySide6.QtCore import QPoint, QRect
+w._set_layout('horizontal')
+w.move(100, 100)
+anchor = w.geometry().bottomRight()
+start = w.pos()
+w._resize_start = ('lt', start, w.geometry())
+w._resize_to(start - QPoint(50, 30))
+assert w.geometry().bottomRight() == anchor
+w._remember_size()
+w._resize_start = None
+w._apply(w.readings, schedule=False)
+assert w.geometry().bottomRight() == anchor
+class Screen:
+    def geometry(self): return QRect(0, 0, 1920, 1080)
+    def availableGeometry(self): return QRect(0, 0, 1920, 1032)
+with patch.object(QApplication, 'screens', return_value=[Screen()]), \
+     patch.object(QApplication, 'primaryScreen', return_value=Screen()):
+    w._reset_size()
+    w.cfg.update(x=500, y=1032)
+    w._position_floating()
+    assert (w.x(), w.y()) == (500, 1032)
+    w._recover_on_screen()
+    assert w.y() == 1032, 'Taskbar placement was forcibly moved into work area'
+''')
+
     @unittest.skipUnless(sys.platform == 'win32', 'Windows activation event')
     def test_duplicate_launch_restores_hidden_window_without_new_fetch(self):
         self.run_qt('''
@@ -200,6 +280,23 @@ class MigrationTests(unittest.TestCase):
 
 
 class WindowPositionTests(unittest.TestCase):
+    def test_layout_cells_fit_minimum_size_and_invalid_settings_fall_back(self):
+        import panel_layout as layout
+        for mode in ('horizontal', 'vertical'):
+            for count in (0, 1, 4, 5, 7, 12):
+                for width in (300, 599, 600, 900, 1200):
+                    height = layout.minimum_height(mode, width, count)
+                    rects = layout.cells(mode, width, height, count)
+                    self.assertEqual(len(rects), count)
+                    for x, y, w, h in rects:
+                        self.assertGreaterEqual(w, 300)
+                        self.assertGreaterEqual(h, 20)
+                        self.assertLessEqual(x + w, width)
+                        self.assertLessEqual(y + h, height)
+        for sizes in (None, [], {'horizontal': ['bad', 20]}, {'horizontal': [True, 20]},
+                      {'horizontal': [900, -1]}, {'horizontal': [9999999, 30]}):
+            self.assertEqual(layout.saved_size({'sizes': sizes}, 'horizontal'), (600, 48))
+
     def test_saved_position_survives_monitor_removal_and_negative_origins(self):
         screens = [(-1920, 0, 1920, 1040), (0, 40, 2560, 1400)]
         self.assertEqual(visible_position(-1800, 100, 300, 104, screens), (-1800, 100))

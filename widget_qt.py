@@ -12,8 +12,8 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QIcon
+from PySide6.QtCore import QRect, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QActionGroup, QColor, QFont, QPainter, QPainterPath, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget, QSystemTrayIcon, QStyle
 
 import autostart
@@ -21,19 +21,14 @@ import display
 import sources
 import single_instance
 import legacy_cleanup
+import panel_layout
 from window_position import visible_position
 
 CONFIG = os.path.join(sources.data_dir(), "config_qt.json")
 
-# 绝对时间（"周二 01:59"）比倒计时占列宽，窗口相应加宽。
-W = 300
-PAD_X, ROW_H, TOP = 11, 22, 8
-X_LABEL, X_PCT = 42, 150
-# 进度条右边界要给 "09-15 01:59" 留够宽度（约 70px）。条是装饰、时间是信息，
-# 宽度不够时先牺牲条。
-BAR_X0, BAR_X1, BAR_H = 158, 204, 6
-X_RESET_END = W - PAD_X
-MIN_ROWS = 4                    # 高度基准，实际行数少于它时也不至于窄成一条
+W = panel_layout.CELL_WIDTH
+PAD_X, BAR_H = 11, 6
+RESIZE_MARGIN = 5
 # 正常轮询间隔。失败后的独立退避由数据层控制，手动刷新也不能绕过。
 REFRESH_SEC = 30
 RADIUS = 10
@@ -64,6 +59,8 @@ class QuotaWidget(QWidget):
         self.readings: list = []
         self.loading = True
         self._drag_pos = None
+        self._resize_start = None
+        self.layout_mode = "horizontal" if self.cfg.get("layout") == "horizontal" else "vertical"
         self._display_signature = None
         self._hidden_by_user = False
         if "taskbar" in self.cfg:
@@ -74,7 +71,8 @@ class QuotaWidget(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowTitle("aifuel")
-        self.resize(W, TOP * 2 + MIN_ROWS * ROW_H)
+        self.setMouseTracking(True)
+        self._resize_floating(recover=False)
 
         self._position_floating()
         self.setWindowOpacity(self.cfg.get("alpha", 0.94))
@@ -214,11 +212,42 @@ class QuotaWidget(QWidget):
 
     # ------------------------------------------------ 交互
 
-    def _resize_floating(self):
-        want_h = TOP * 2 + max(MIN_ROWS, len(self.readings)) * ROW_H
-        if self.width() != W or self.height() != want_h:
-            self.resize(W, want_h)
-            self._recover_on_screen()
+    def _resize_floating(self, recover=True):
+        if self._resize_start is not None:
+            return
+        width, height = panel_layout.saved_size(self.cfg, self.layout_mode)
+        minimum = panel_layout.minimum_height(self.layout_mode, width, len(self.readings))
+        self.setMinimumSize(W, minimum)
+        if self.width() != width or self.height() != max(height, minimum):
+            self.resize(width, max(height, minimum))
+            if recover:
+                self._recover_on_screen()
+
+    def _remember_size(self):
+        if not isinstance(self.cfg.get("sizes"), dict):
+            self.cfg["sizes"] = {}
+        self.cfg["sizes"][self.layout_mode] = [self.width(), self.height()]
+        self.cfg.update(x=self.x(), y=self.y())
+        self._save_cfg()
+
+    def _set_layout(self, mode):
+        if mode == self.layout_mode:
+            return
+        self._drag_pos = self._resize_start = None
+        self.layout_mode = mode
+        self.cfg["layout"] = mode
+        self._resize_floating()
+        self.cfg.update(x=self.x(), y=self.y())
+        self._save_cfg()
+        self.update()
+
+    def _reset_size(self):
+        sizes = self.cfg.get("sizes")
+        if isinstance(sizes, dict):
+            sizes.pop(self.layout_mode, None)
+        self._resize_floating()
+        self._save_cfg()
+        self.update()
 
     def _show_window(self):
         self._hidden_by_user = False
@@ -245,18 +274,22 @@ class QuotaWidget(QWidget):
 
     def _set_locked(self, locked):
         self.cfg["locked"] = bool(locked)
-        self._drag_pos = None
+        self._drag_pos = self._resize_start = None
+        self.unsetCursor()
         self._save_cfg()
 
     def _screen_added(self, screen):
         screen.availableGeometryChanged.connect(self._screen_changed)
+        screen.geometryChanged.connect(self._screen_changed)
         self._screen_changed()
 
     def _screen_changed(self, *_):
         QTimer.singleShot(0, self._recover_on_screen)
 
     def _recover_on_screen(self):
-        areas = [s.availableGeometry() for s in QApplication.screens()]
+        # Saved/taskbar-overlapping positions are intentional. Recover only
+        # against monitor bounds, not the work area excluding the taskbar.
+        areas = [s.geometry() for s in QApplication.screens()]
         if not areas:
             return
         x, y = visible_position(self.x(), self.y(), self.width(), self.height(),
@@ -267,26 +300,64 @@ class QuotaWidget(QWidget):
             self._save_cfg()
 
     def _position_floating(self):
-        screens = [s.availableGeometry() for s in QApplication.screens()]
+        screens = [s.geometry() for s in QApplication.screens()]
         primary = QApplication.primaryScreen().availableGeometry()
-        x, y = visible_position(self.cfg.get("x", primary.right() - W - 24),
+        x, y = visible_position(self.cfg.get("x", primary.right() - self.width() - 24),
                                 self.cfg.get("y", primary.top() + 48), self.width(), self.height(),
                                 [(r.x(), r.y(), r.width(), r.height()) for r in screens])
         self.move(x, y)
 
     def mousePressEvent(self, e) -> None:
         if e.button() == Qt.LeftButton and not self.cfg.get("locked"):
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            edges = self._resize_edges(e.position())
+            if edges:
+                self._resize_start = (edges, e.globalPosition().toPoint(), self.geometry())
+            else:
+                self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def _resize_edges(self, point):
+        if self.cfg.get("locked"):
+            return ""
+        return (("l" if point.x() < RESIZE_MARGIN else "r" if point.x() >= self.width() - RESIZE_MARGIN else "")
+                + ("t" if point.y() < RESIZE_MARGIN else "b" if point.y() >= self.height() - RESIZE_MARGIN else ""))
+
+    def _resize_to(self, point):
+        edges, start, rect = self._resize_start
+        delta = point - start
+        width = max(W, rect.width() + (delta.x() if "r" in edges else -delta.x() if "l" in edges else 0))
+        minimum = panel_layout.minimum_height(self.layout_mode, width, len(self.readings))
+        height = max(minimum, rect.height() + (delta.y() if "b" in edges else -delta.y() if "t" in edges else 0))
+        x = rect.right() + 1 - width if "l" in edges else rect.x()
+        y = rect.bottom() + 1 - height if "t" in edges else rect.y()
+        self.setMinimumSize(W, minimum)
+        self.setGeometry(QRect(x, y, width, height))
 
     def mouseMoveEvent(self, e) -> None:
-        if self._drag_pos is not None and e.buttons() & Qt.LeftButton:
+        if self._resize_start is not None and e.buttons() & Qt.LeftButton:
+            self._resize_to(e.globalPosition().toPoint())
+        elif self._drag_pos is not None and e.buttons() & Qt.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag_pos)
+        else:
+            edges = self._resize_edges(e.position())
+            cursor = {"l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+                      "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+                      "lt": Qt.SizeFDiagCursor, "rb": Qt.SizeFDiagCursor,
+                      "rt": Qt.SizeBDiagCursor, "lb": Qt.SizeBDiagCursor}
+            self.setCursor(cursor.get(edges, Qt.ArrowCursor))
+
+    def leaveEvent(self, event):
+        if self._resize_start is None:
+            self.unsetCursor()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, e) -> None:
+        if self._resize_start is not None:
+            self._remember_size()
         if self._drag_pos is not None:
             self.cfg["x"], self.cfg["y"] = self.x(), self.y()
             self._save_cfg()
-        self._drag_pos = None
+        self._drag_pos = self._resize_start = None
+        self._resize_floating()
 
     def mouseDoubleClickEvent(self, e) -> None:
         if e.button() == Qt.LeftButton:
@@ -307,6 +378,15 @@ class QuotaWidget(QWidget):
         locked = menu.addAction("锁定位置")
         locked.setCheckable(True)
         locked.triggered.connect(self._set_locked)
+        layout_menu = menu.addMenu("布局")
+        layout_group = QActionGroup(layout_menu)
+        for mode, label in (("vertical", "纵向面板"), ("horizontal", "横向紧凑条")):
+            action = layout_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(mode)
+            layout_group.addAction(action)
+            action.triggered.connect(lambda _checked=False, value=mode: self._set_layout(value))
+        reset_size = menu.addAction("恢复当前布局默认尺寸", self._reset_size)
         menu.addAction("立即刷新", self.refresh)
         menu.addAction("额度详情（百分比为已用）", lambda: QMessageBox.information(
             self, "额度详情", display.details(self.readings)))
@@ -324,6 +404,10 @@ class QuotaWidget(QWidget):
             visibility.setText("隐藏悬浮窗" if self.isVisible() else "显示悬浮窗")
             visibility.setEnabled(not self.isVisible() or self._can_hide())
             locked.setChecked(bool(self.cfg.get("locked")))
+            for action in layout_group.actions():
+                action.setChecked(action.data() == self.layout_mode)
+            layout_menu.setEnabled(not self.cfg.get("locked"))
+            reset_size.setEnabled(not self.cfg.get("locked"))
             startup.setChecked(autostart.is_enabled())
 
         menu.aboutToShow.connect(sync_actions)
@@ -346,18 +430,8 @@ class QuotaWidget(QWidget):
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        # 一律用窗口的「逻辑」尺寸算布局。在 125%/150% DPI 缩放下，
-        # resize() 拿到的物理像素和绘制用的逻辑坐标不是一回事，
-        # 硬编码常量会让最后一行溢出窗口被裁掉。
+        # All geometry is in logical pixels; fonts keep their point sizes.
         w, h = float(self.width()), float(self.height())
-        sx = w / W
-        pad, x_label, x_pct = PAD_X * sx, X_LABEL * sx, X_PCT * sx
-        bar0, bar1 = BAR_X0 * sx, BAR_X1 * sx
-        x_reset_end = X_RESET_END * sx
-        rows = max(MIN_ROWS, len(self.readings))
-        top = h * TOP / (TOP * 2 + rows * ROW_H)
-        row_h = (h - 2 * top) / rows
-        bar_h = max(4.0, BAR_H * sx)
 
         path = QPainterPath()
         path.addRoundedRect(QRectF(0, 0, w, h), RADIUS, RADIUS)
@@ -379,23 +453,29 @@ class QuotaWidget(QWidget):
         small_cjk = QFont("Microsoft YaHei", 7)     # 绝对时间里有"周二"这样的汉字
 
         prev_provider = None
-        for i, r in enumerate(self.readings):
-            res = display.resolve(r)
-            y = top + i * row_h
+        rects = panel_layout.cells(self.layout_mode, self.width(), self.height(), len(self.readings))
+        for r, (x, y, width, row_h) in zip(self.readings, rects):
+            # Stable columns reserve room for both reset times and error states.
+            # Only the progress track grows when a cell is made wider.
+            label_x, pct_x = x + 38, x + 90
+            bar0, bar1 = x + 140, x + width - 100
+            reset_end = x + width - PAD_X
             cy = y + row_h / 2
-
-            # 品牌名只在该服务的第一行标一次
-            if r.provider != prev_provider:
+            if self.layout_mode == "horizontal" and x > 0:
+                p.setPen(_qc("#343940"))
+                p.drawLine(int(x), int(y + 3), int(x), int(y + row_h - 3))
+            res = display.resolve(r)
+            if self.layout_mode == "horizontal" or r.provider != prev_provider:
                 p.setPen(_qc(display.BRAND.get(r.provider, display.FG)))
                 p.setFont(brand_f)
-                p.drawText(QRectF(pad, y, x_label - pad, row_h),
+                p.drawText(QRectF(x + PAD_X, y, 25, row_h),
                            Qt.AlignVCenter | Qt.AlignLeft,
                            display.NAME.get(r.provider, r.provider[:3].upper()))
-                prev_provider = r.provider
+            prev_provider = r.provider
 
             p.setPen(_qc(display.FG_DIM))
             p.setFont(small_cjk if any(ord(c) > 127 for c in r.label) else small)
-            p.drawText(QRectF(x_label, y, (x_pct - x_label) * 0.55, row_h),
+            p.drawText(QRectF(label_x, y, pct_x - label_x, row_h),
                        Qt.AlignVCenter | Qt.AlignLeft, r.label)
 
             p.setPen(_qc(res.color, 150 if res.dim else 255))
@@ -404,29 +484,29 @@ class QuotaWidget(QWidget):
                 val = res.text
             else:
                 val = "--" if res.percent is None else "%d%%" % round(res.percent)
-            p.drawText(QRectF(x_label + (x_pct - x_label) * 0.5, y,
-                              (x_pct - x_label) * 0.5, row_h),
+            # Text balances can use the otherwise empty progress-bar space.
+            value_end = bar0 - 6 if r.text is None else bar1
+            p.drawText(QRectF(pct_x, y, value_end - pct_x, row_h),
                        Qt.AlignVCenter | Qt.AlignRight, val + res.note)
 
-            # 只有百分比类的行才画进度条
             if r.text is None:
                 track = QPainterPath()
-                track.addRoundedRect(QRectF(bar0, cy - bar_h / 2, bar1 - bar0, bar_h),
-                                     bar_h / 2, bar_h / 2)
+                track.addRoundedRect(QRectF(bar0, cy - BAR_H / 2, bar1 - bar0, BAR_H),
+                                     BAR_H / 2, BAR_H / 2)
                 p.fillPath(track, _qc(display.TRACK))
                 if res.percent is not None:
                     fw = (bar1 - bar0) * min(100.0, max(0.0, res.percent)) / 100.0
                     if fw >= 2:
                         fill = QPainterPath()
-                        fill.addRoundedRect(QRectF(bar0, cy - bar_h / 2, fw, bar_h),
-                                            bar_h / 2, bar_h / 2)
+                        fill.addRoundedRect(QRectF(bar0, cy - BAR_H / 2, fw, BAR_H),
+                                            BAR_H / 2, BAR_H / 2)
                         p.fillPath(fill, _qc(res.color, 150 if res.dim else 255))
 
             reset_txt = display.status_text(r)
             if reset_txt:
                 p.setPen(_qc(display.FG_DIM))
                 p.setFont(small_cjk if any(ord(c) > 127 for c in reset_txt) else small)
-                p.drawText(QRectF(bar1, y, x_reset_end - bar1, row_h),
+                p.drawText(QRectF(bar1 + 6, y, reset_end - bar1 - 6, row_h),
                            Qt.AlignVCenter | Qt.AlignRight, reset_txt)
 
 
