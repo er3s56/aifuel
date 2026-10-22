@@ -112,8 +112,11 @@ Claude Code 会话抢写。助手只发送初始化/额度控制消息，不发�
 已在 Claude Code 2.1.233 上验证自动续期。
 
 Windows 上没有 CLI 凭证且未指定 `CLAUDE_CONFIG_DIR` 时，使用 Claude 桌面端已保存
-的 Code 授权，兼容普通安装和 MSIX 安装的数据目录。通过 Windows DPAPI / CNG
-读取桌面端的加密 OAuth 存储，仅在内存中用于额度请求；不读取浏览器 Cookie，
+的 Code 授权，兼容普通安装、MSIX 旧目录和新版 `Claude-Data` 目录。
+自动发现实际包家族名，不固定发布者后缀；发现迁移标记或同包家族的新目录后，
+不再读取旧目录的授权，即使新目录暂时不可用或已退出登录。多个目录存在不同账户时
+明确提示选择账户，不按修改时间切换账户。内置 CLI 兼容版本目录下直接存放和多一层构建目录的布局。
+通过 Windows DPAPI / CNG 读取桌面端的加密 OAuth 存储，仅在内存中用于额度请求；不读取浏览器 Cookie，
 不复制或写入凭证，不替桌面端轮换 refresh token。桌面端授权过期或尚未生成时，
 请打开 Claude 的 Code 模式；授权更新后自动恢复，不必重启 AI Fuel。
 已有 CLI 凭证时优先使用 CLI，并尝试官方自动续期。CLI 无法提供有效授权时，
@@ -193,7 +196,7 @@ CLI 文件残留但令牌已清空也可恢复，无需删除文件或重新登�
 双击项目根目录的 **`build-installer.cmd`**。窗口会保留构建结果，不需要记住
 PowerShell 命令或永久修改执行策略。Python 和依赖仍需与下方便携版构建环境一致。
 
-产物在 `dist\installer\AI-Fuel-0.2.3-windows-x64-setup.exe`，旁边的 `.sha256`
+产物在 `dist\installer\AI-Fuel-0.2.4-windows-x64-setup.exe`，旁边的 `.sha256`
 文件用于校验。发布时只需分发这个安装包，用户无需 Python、编译器或 PowerShell 操作。
 指定版本可运行 `build-installer.cmd -Version 0.2.0`；自定义编译器位置使用
 `-IsccPath "C:\工具目录\ISCC.exe"`。

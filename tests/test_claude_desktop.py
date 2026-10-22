@@ -306,6 +306,20 @@ class DesktopDiscoveryTests(IsolatedTest):
             claude_auth.find_claude()
         self.assertEqual(caught.exception.kind, "dependency")
 
+    def test_nested_component_is_discovered_but_arbitrary_depth_is_not(self):
+        old = self.component("2.1.260")
+        os.utime(old, (1000, 1000))
+        nested = self.state / "claude-code" / "2.1.304" / "build-id" / "claude.exe"
+        nested.parent.mkdir(parents=True)
+        nested.touch()
+        self.assertEqual(desktop.find_cli(), str(nested))
+        nested.unlink()
+        for parent in ("app/build-id", "2.1.304/build-id/extra"):
+            wrong = self.state / "claude-code" / parent / "claude.exe"
+            wrong.parent.mkdir(parents=True, exist_ok=True)
+            wrong.touch()
+        self.assertEqual(desktop.find_cli(), str(old))
+
     def test_explicit_cli_and_standalone_cli_keep_priority(self):
         desktop_cli = self.component("2.1.266")
         installed = self.state / "home" / ".local" / "bin" / "claude.exe"
@@ -314,6 +328,100 @@ class DesktopDiscoveryTests(IsolatedTest):
         self.assertEqual(claude_auth.find_claude(), str(installed))
         with patch.dict(os.environ, AIFUEL_CLAUDE_EXE=str(desktop_cli)):
             self.assertEqual(claude_auth.find_claude(), str(desktop_cli))
+
+
+class DesktopDirectoryTests(IsolatedTest):
+    def setUp(self):
+        super().setUp()
+        self.local = self.state / "local"
+        self.roaming = self.state / "roaming"
+        self.enterContext(patch.dict(os.environ, LOCALAPPDATA=str(self.local), APPDATA=str(self.roaming)))
+        self.enterContext(patch.object(desktop.sys, "platform", "win32"))
+
+    def profile(self, path, account="active", cache="encrypted"):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "config.json").write_text(json.dumps({
+            "lastKnownAccountUuid": account, "oauth:tokenCacheV2": cache}), encoding="utf-8")
+        return path
+
+    def old(self, family="Claude_testpublisher"):
+        return self.local / "Packages" / family / "LocalCache" / "Roaming" / "Claude"
+
+    def moved(self, family="claude_testpublisher"):
+        return self.local / "Claude-Data" / family
+
+    def test_discovers_old_msix_and_unpacked_profiles_without_fixed_publisher(self):
+        old = self.profile(self.old("Claude_differentpublisher"))
+        plain = self.profile(self.roaming / "Claude")
+        self.assertEqual(set(desktop.data_roots()), {old, plain})
+
+    def test_new_location_works_without_old_package_directory(self):
+        new = self.profile(self.moved("claude_anotherpublisher"))
+        self.assertEqual(desktop._config_path(), new / "config.json")
+
+    def test_migrated_profile_overrides_newer_old_profile_with_or_without_marker(self):
+        old, new = self.profile(self.old()), self.profile(self.moved())
+        os.utime(new / "config.json", (1000, 1000))
+        for marker in (False, True):
+            with self.subTest(marker=marker):
+                if marker:
+                    (old / ".user-data-left.claude_testpublisher").touch()
+                self.assertNotIn(old, desktop.data_roots())
+                self.assertEqual(desktop._config_path(), new / "config.json")
+
+    def test_missing_migration_destination_never_revives_old_authorization(self):
+        old = self.profile(self.old())
+        (old / ".user-data-left.claude_testpublisher").touch()
+        self.assertIsNone(desktop._config_path())
+        with self.assertRaises(QueryError):
+            desktop.access_token()
+
+    def test_logged_out_destination_does_not_use_old_valid_cache(self):
+        self.profile(self.old())
+        new = self.profile(self.moved(), account=None, cache=None)
+        os.utime(new / "config.json", (1000, 1000))
+        with patch.object(desktop, "_decrypt_cache") as decrypt, self.assertRaises(QueryError):
+            desktop.access_token()
+        decrypt.assert_not_called()
+
+    def test_roaming_migration_marker_is_followed(self):
+        old = self.profile(self.roaming / "Claude")
+        (old / ".user-data-left.claude_testpublisher").touch()
+        new = self.profile(self.moved())
+        self.assertEqual(desktop.data_roots(), [new])
+
+    def test_unrelated_directories_and_mismatched_marker_are_ignored(self):
+        old = self.profile(self.old())
+        (old / ".user-data-left.claude_otherpublisher").touch()
+        for name in ("Other_testpublisher", "Claude", "claude_test.extra"):
+            self.profile(self.moved(name), account="other")
+        self.assertEqual(desktop._config_path(), old / "config.json")
+
+    def test_multiple_accounts_require_explicit_login_and_stamp_stays_safe(self):
+        self.profile(self.moved("claude_one"), account="one")
+        self.profile(self.moved("claude_two"), account="two")
+        with self.assertRaisesRegex(QueryError, "多个 Claude 账户"):
+            desktop.access_token()
+        self.assertIsNone(desktop.credential_stamp())
+
+    def test_same_account_uses_latest_profile_including_logout(self):
+        old = self.profile(self.old("Claude_one"))
+        self.profile(self.moved("claude_two"), account=None, cache=None)
+        os.utime(old / "config.json", (1000, 1000))
+        with self.assertRaises(QueryError):
+            desktop.access_token()
+
+    def test_migration_changes_stamp_and_preserves_account_check(self):
+        old = self.profile(self.old())
+        stamp = desktop.credential_stamp()
+        self.profile(self.moved())
+        (old / ".user-data-left.claude_testpublisher").touch()
+        self.assertNotEqual(desktop.credential_stamp(), stamp)
+        with patch.object(desktop, "_decrypt_cache", return_value={cache_key(): entry()}), \
+             patch.object(desktop.time, "time", return_value=2000):
+            self.assertEqual(desktop.access_token(required_identity=("active", "org-one")), "test-desktop-token")
+            with self.assertRaises(QueryError):
+                desktop.access_token(required_identity=("other", "org-one"))
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows system cryptography")
