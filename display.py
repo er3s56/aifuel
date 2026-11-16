@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """显示层：把 Reading 变成「显示什么文字、用什么颜色」。
 
-UI 无关 —— tkinter 和 PySide6 两个窗口都调这里，保证两版行为一致。
+将额度状态转换为显示内容，独立于 Qt 绘制逻辑。
 """
 from __future__ import annotations
 
@@ -34,21 +34,6 @@ class Resolved:
     dim: bool                  # True -> 整行压暗，表示数据不可信
     note: str                  # 追加在行尾的小标记，如 "⟳" / "?"；无则空串
     text: Optional[str] = None  # 只有通过新鲜度检查的余额才允许前端显示
-
-
-def dimmed(hex_color: str, t: float = 0.55) -> str:
-    """把颜色朝背景色混，用来表达「数据不新鲜」。
-
-    tkinter 的 Canvas 不支持单个图元设透明度（Qt 那边直接调 alpha 就行），
-    所以 tk 版只能手工算混色。t 是混向背景的比例。
-    """
-    def rgb(h):
-        h = h.lstrip("#")
-        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-    fr, fg_, fb = rgb(hex_color)
-    br, bg_, bb = rgb(BG)
-    mix = lambda f, b: int(round(f + (b - f) * t))
-    return "#%02x%02x%02x" % (mix(fr, br), mix(fg_, bg_), mix(fb, bb))
 
 
 def fmt_reset(resets_at: Optional[float]) -> str:
@@ -156,7 +141,7 @@ def _sample_time(timestamp):
 
 
 def details(readings: list[Reading]) -> str:
-    """两版共用的额度口径、采样时间和缓存状态说明。"""
+    """额度口径、采样时间和缓存状态说明。"""
     lines = ["面板百分比表示已用额度；剩余额度 = 100% − 已用额度。"]
     for reading in readings:
         resolved = resolve(reading)

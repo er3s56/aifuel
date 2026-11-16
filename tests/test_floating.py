@@ -363,7 +363,8 @@ class MigrationTests(unittest.TestCase):
                 self.assertFalse(autostart.is_enabled())
                 Path(autostart.startup_dir()).mkdir(parents=True)
                 for target in (Path(temp) / 'other.exe', Path(temp) / '旧版' / 'aifuel.exe',
-                               Path(temp) / '源码' / 'run_qt.vbs'):
+                               Path(temp) / '源码' / 'run_qt.vbs',
+                               Path(temp) / '旧版' / 'run_tk.vbs'):
                     target.parent.mkdir(exist_ok=True)
                     target.touch()
                     autostart._make_shortcut(autostart.link_path(), str(target), str(target.parent))

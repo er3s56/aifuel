@@ -7,18 +7,11 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 import uuid
 
 import autostart
-
-# 模块导入时不创建用户的真实运行目录；每个测试都使用独立的运行目录。
-with patch("os.makedirs"):
-    import sources
-    import widget_tk
-
 
 PROJECT = Path(__file__).resolve().parents[1]
 
@@ -37,139 +30,6 @@ class IsolatedTest(unittest.TestCase):
         shutil.rmtree(path)
 
 
-class Scheduler:
-    """手动推进 Tk 主线程回调，避免测试依赖真实桌面或等待 30 秒。"""
-    def __init__(self):
-        self.pending = {}
-        self.serial = 0
-        self.destroyed = False
-        self.owner = threading.get_ident()
-
-    def after(self, delay, callback, *args):
-        assert threading.get_ident() == self.owner
-        assert not self.destroyed
-        self.serial += 1
-        self.pending[self.serial] = (delay, callback, args)
-        return self.serial
-
-    def after_cancel(self, timer_id):
-        assert threading.get_ident() == self.owner
-        self.pending.pop(timer_id, None)
-
-    def tick(self):
-        due, self.pending = self.pending, {}
-        for _, callback, args in due.values():
-            callback(*args)
-
-    def destroy(self):
-        self.destroyed = True
-
-
-class TkTests(unittest.TestCase):
-    def setUp(self):
-        self.scheduler = Scheduler()
-        root = Mock()
-        root.winfo_screenwidth.return_value = 1920
-        root.after = self.scheduler.after
-        root.after_cancel = self.scheduler.after_cancel
-        root.destroy = self.scheduler.destroy
-        for target, value in (("tk.Tk", Mock(return_value=root)),
-                              ("tk.Canvas", Mock()), ("load_config", Mock(return_value={})),
-                              ("QuotaWidget.draw", Mock())):
-            self.enterContext(patch("widget_tk." + target, value))
-        self.enterContext(patch.object(sources, "backoff_remaining", return_value=0))
-
-    def synchronous_threads(self):
-        class InlineThread:
-            def __init__(self, target, **kwargs):
-                self.target = target
-
-            def start(self):
-                self.target()
-        return patch.object(widget_tk.threading, "Thread", InlineThread)
-
-    def test_manual_refresh_keeps_one_periodic_chain(self):
-        with self.synchronous_threads(), patch.object(sources, "read_all", return_value=[]) as read:
-            widget = widget_tk.QuotaWidget()
-            self.scheduler.tick()
-            for _ in range(3):
-                widget.refresh()
-                self.scheduler.tick()
-                self.assertEqual(len(self.scheduler.pending), 2)  # 刷新链 + 纯显示计时器
-            self.assertEqual(read.call_count, 4)
-            self.scheduler.tick()   # 唯一的自动刷新
-            self.scheduler.tick()   # 主线程接收结果
-            self.assertEqual(read.call_count, 5)
-            self.assertEqual(len(self.scheduler.pending), 2)
-            widget.close()
-            self.assertFalse(self.scheduler.pending)
-
-    def test_repeated_refresh_during_fetch_starts_only_one_request(self):
-        with self.synchronous_threads(), patch.object(sources, "read_all", return_value=[]) as read:
-            widget = widget_tk.QuotaWidget()
-            for _ in range(5):
-                widget.refresh()  # 结果仍未被主线程接收
-            read.assert_called_once()
-            self.scheduler.tick()
-            self.assertEqual(len(self.scheduler.pending), 2)
-            widget.close()
-
-    def test_close_during_fetch_never_calls_tk_from_worker(self):
-        started, release, finished = threading.Event(), threading.Event(), threading.Event()
-        errors = []
-        original_fetch = widget_tk.QuotaWidget._fetch
-
-        def slow_read(on_result=None):
-            started.set()
-            if not release.wait(2):
-                raise TimeoutError("Test worker was not released")
-            return []
-
-        def observed_fetch(widget):
-            try:
-                original_fetch(widget)
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                finished.set()
-
-        with patch.object(sources, "read_all", side_effect=slow_read), \
-                patch.object(widget_tk.QuotaWidget, "_fetch", observed_fetch):
-            widget = widget_tk.QuotaWidget()
-            try:
-                self.assertTrue(started.wait(2))
-                widget.close()
-                self.assertFalse(self.scheduler.pending)
-            finally:
-                release.set()
-                self.assertTrue(finished.wait(2))
-            self.assertEqual(errors, [])
-
-    def test_tk_menu_enables_tk_autostart(self):
-        with self.synchronous_threads(), patch.object(sources, "read_all", return_value=[]):
-            widget = widget_tk.QuotaWidget()
-        widget._auto_var = Mock()
-        widget._auto_var.get.return_value = True
-        with patch.object(autostart, "enable", return_value=(True, "OK")) as enable:
-            widget._toggle_autostart()
-        enable.assert_called_once_with("tk")
-
-    def test_partial_result_updates_before_completion_and_display_tick_never_queries(self):
-        with self.synchronous_threads(), patch.object(sources, "read_all", return_value=[]) as read:
-            widget = widget_tk.QuotaWidget()
-            self.scheduler.tick()
-            widget._fetching = True
-            reading = sources.Reading("chatgpt", "wk", 18)
-            widget._results.put((False, [reading]))
-            widget._poll_result()
-            self.assertEqual(widget.readings, [reading])
-            self.assertTrue(widget._fetching)
-            widget._display_tick()
-            read.assert_called_once()
-            widget.close()
-        widget.close()
-
-
 class AutostartTests(IsolatedTest):
     @unittest.skipUnless(os.name == "nt", "Windows shortcut COM")
     def test_shortcut_paths_are_data_even_with_smart_quotes_and_code_like_text(self):
@@ -180,25 +40,24 @@ class AutostartTests(IsolatedTest):
         self.assertTrue(link.is_file())
         self.assertEqual(autostart._read_shortcut(str(link)), (str(target), ""))
 
-    def test_source_frontends_choose_their_own_launchers(self):
+    def test_source_app_targets_qt_launcher(self):
         with patch.object(sys, "frozen", False, create=True):
-            for frontend in ("tk", "qt"):
-                target, workdir = autostart.target(frontend)
-                self.assertEqual(Path(target).name, "run_%s.vbs" % frontend)
-                self.assertEqual(Path(workdir), PROJECT)
+            target, workdir = autostart.target()
+            self.assertEqual(Path(target).name, "run_qt.vbs")
+            self.assertEqual(Path(workdir), PROJECT)
 
     def test_frozen_app_always_targets_itself(self):
         with patch.object(sys, "frozen", True, create=True):
-            self.assertEqual(autostart.target("tk")[0], os.path.abspath(sys.executable))
+            self.assertEqual(autostart.target()[0], os.path.abspath(sys.executable))
 
     def test_missing_launcher_reports_failure_without_creating_shortcut(self):
         with patch.object(autostart, "_here", return_value=str(self.state)), \
                 patch.object(sys, "frozen", False, create=True), \
                 patch.object(sys, "platform", "win32"), \
                 patch.object(autostart, "_make_shortcut") as make:
-            ok, message = autostart.enable("tk")
+            ok, message = autostart.enable()
         self.assertFalse(ok)
-        self.assertIn("run_tk.vbs", message)
+        self.assertIn("run_qt.vbs", message)
         make.assert_not_called()
 
 
@@ -397,21 +256,3 @@ class PackagedTests(IsolatedTest):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TkMenuTests(unittest.TestCase):
-    def test_tk_repeated_context_menus_keep_only_one_menu_tree(self):
-        import tkinter as tk
-        from types import SimpleNamespace
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            widget = widget_tk.QuotaWidget.__new__(widget_tk.QuotaWidget)
-            widget.root, widget.readings = root, []
-            with patch.object(tk.Menu, 'tk_popup'), patch.object(autostart, 'is_enabled', return_value=False):
-                for _ in range(100):
-                    widget._menu(SimpleNamespace(x_root=0, y_root=0))
-            self.assertEqual(len(root.winfo_children()), 1)
-            self.assertEqual(len(widget._context_menu.winfo_children()), 1)
-        finally:
-            root.destroy()

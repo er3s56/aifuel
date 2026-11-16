@@ -34,17 +34,15 @@ def _here() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def target(frontend: str = "qt") -> "tuple[str, str]":
+def target() -> "tuple[str, str]":
     """返回 (要启动的东西, 工作目录)。
 
-    打包成 exe 时就指向自己；源码运行时指向当前前端的 .vbs 启动器。
+    打包成 exe 时就指向自己；源码运行时指向 Qt 的 .vbs 启动器。
     """
     here = _here()
     if getattr(sys, "frozen", False):
         return os.path.abspath(sys.executable), here
-    if frontend not in ("qt", "tk"):
-        raise ValueError("未知前端: %s" % frontend)
-    return os.path.join(here, "run_%s.vbs" % frontend), here
+    return os.path.join(here, "run_qt.vbs"), here
 
 
 def is_enabled() -> bool:
@@ -115,11 +113,11 @@ def _make_shortcut(link: str, tgt: str, workdir: str, icon: str = "") -> None:
         _com_method(persist, 6, [wt.LPCWSTR, wt.BOOL], link, True)
 
 
-def enable(frontend: str = "qt") -> "tuple[bool, str]":
+def enable() -> "tuple[bool, str]":
     """开启自启。返回 (成功?, 给用户看的说明)。"""
     if sys.platform != "win32":
         return False, "只支持 Windows"
-    tgt, workdir = target(frontend)
+    tgt, workdir = target()
     if not os.path.exists(tgt):
         return False, "找不到启动目标：\n%s\n请保留对应的 VBS 启动器，或重新打包 exe。" % tgt
     try:
@@ -161,6 +159,7 @@ def migrate_existing() -> tuple[bool, str]:
         name = os.path.basename(previous).lower()
         owned = name in ("aifuel.exe", "aifuel_debug.exe")
         if name == "wscript.exe":
+            # Retired launchers are recognized only to migrate existing links to Qt.
             owned = os.path.basename(arguments.strip('"')).lower() in ("run_qt.vbs", "run_tk.vbs")
         if not owned:
             return True, "保留其他程序的快捷方式"
