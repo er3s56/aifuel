@@ -268,6 +268,7 @@ if sys.platform == 'win32':
 from PySide6.QtCore import QCoreApplication, QEvent, QThread, QTimer
 from PySide6.QtWidgets import QApplication
 import sources, widget_qt
+widget_qt.fullscreen.foreground_fullscreen = lambda: False
 app = QApplication([])
 def drain_until(predicate):
     deadline = time.monotonic() + 3

@@ -23,6 +23,7 @@ import single_instance
 import legacy_cleanup
 import panel_layout
 import window_topmost
+import fullscreen
 from window_position import visible_position
 
 CONFIG = os.path.join(sources.data_dir(), "config_qt.json")
@@ -64,6 +65,7 @@ class QuotaWidget(QWidget):
         self.layout_mode = "horizontal" if self.cfg.get("layout") == "horizontal" else "vertical"
         self._display_signature = None
         self._hidden_by_user = False
+        self._hidden_by_fullscreen = False
         self._closing = False
         self._topmost_timer = QTimer(self)
         self._topmost_timer.setSingleShot(True)
@@ -90,6 +92,9 @@ class QuotaWidget(QWidget):
         self.display_timer.timeout.connect(self._update_display)
         self.display_timer.start(1000)
         self._thread = None
+        self.visibility_timer = QTimer(self)
+        self.visibility_timer.timeout.connect(self._sync_visibility)
+        self.visibility_timer.start(fullscreen.POLL_MS)
         self.reopen_timer = QTimer(self)
         self.reopen_timer.timeout.connect(self._resume_if_requested)
         self.reopen_timer.start(250)
@@ -153,6 +158,7 @@ class QuotaWidget(QWidget):
         self._closing = False
         single_instance.cancel_shutdown()
         self.display_timer.start(1000)
+        self.visibility_timer.start(fullscreen.POLL_MS)
         self._tray.show()
         self._show_window()
         if was_closing and self._thread is None:
@@ -165,6 +171,7 @@ class QuotaWidget(QWidget):
         self.reopen_timer.stop()
         self.timer.stop()
         self.display_timer.stop()
+        self.visibility_timer.stop()
         self._tray.hide()
         if self._thread is not None:
             self._thread.wait()
@@ -174,6 +181,7 @@ class QuotaWidget(QWidget):
         self._closing = True
         self.timer.stop()
         self.display_timer.stop()
+        self.visibility_timer.stop()
         self._tray.hide()
         if self._thread is not None:
             self.hide()
@@ -189,8 +197,6 @@ class QuotaWidget(QWidget):
     def _update_display(self) -> None:
         if self._closing:
             return
-        if self._hidden_by_user and not QSystemTrayIcon.isSystemTrayAvailable():
-            self._show_window()  # Never leave a hidden app without a recovery entry.
         detail = display.details(self.readings)
         if self.toolTip() != detail:
             self.setToolTip(detail)
@@ -234,7 +240,8 @@ class QuotaWidget(QWidget):
             timer.start(0)
 
     def _restore_topmost(self):
-        if (self._closing or self._hidden_by_user or not self.isVisible() or self.isMinimized()
+        if (self._closing or self._hidden_by_user or self._hidden_by_fullscreen
+                or not self.isVisible() or self.isMinimized()
                 or not self.windowFlags() & Qt.WindowStaysOnTopHint):
             return
         window_topmost.restore_if_lost(int(self.winId()))
@@ -278,9 +285,21 @@ class QuotaWidget(QWidget):
 
     def _show_window(self):
         self._hidden_by_user = False
-        self._recover_on_screen()
-        self.show()
-        self.raise_()
+        self._sync_visibility()
+
+    def _sync_visibility(self):
+        if self._closing:
+            return
+        detected = fullscreen.foreground_fullscreen()
+        if detected is not None:
+            self._hidden_by_fullscreen = detected
+        if self._hidden_by_user or self._hidden_by_fullscreen:
+            if self.isVisible():
+                self.hide()
+        elif not self.isVisible():
+            self._recover_on_screen()
+            # WA_ShowWithoutActivating preserves the foreground app on restore.
+            self.show()
 
     def _can_hide(self):
         return self._tray.isVisible() and QSystemTrayIcon.isSystemTrayAvailable()
@@ -288,7 +307,7 @@ class QuotaWidget(QWidget):
     def _toggle_visibility(self):
         if self._closing:
             return
-        if self.isVisible():
+        if not self._hidden_by_user:
             if self._can_hide():
                 self._hidden_by_user = True
                 self.hide()
@@ -428,8 +447,9 @@ class QuotaWidget(QWidget):
         menu.addAction("退出", self.close)
 
         def sync_actions():
-            visibility.setText("隐藏悬浮窗" if self.isVisible() else "显示悬浮窗")
-            visibility.setEnabled(not self.isVisible() or self._can_hide())
+            visibility.setText("显示悬浮窗" if self._hidden_by_user else
+                               "保持隐藏（全屏结束后也不恢复）" if self._hidden_by_fullscreen else "隐藏悬浮窗")
+            visibility.setEnabled(self._hidden_by_user or self._can_hide())
             locked.setChecked(bool(self.cfg.get("locked")))
             for action in layout_group.actions():
                 action.setChecked(action.data() == self.layout_mode)
@@ -601,7 +621,7 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(False)
     w = QuotaWidget()
     # Old --taskbar/--floating shortcuts remain valid and now show the same panel.
-    w.show()
+    w._show_window()
     threading.Thread(target=legacy_cleanup.stop_private_runtime, daemon=True).start()
     sys.exit(app.exec())
 

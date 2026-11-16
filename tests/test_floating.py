@@ -24,6 +24,7 @@ from PySide6.QtCore import QEvent, QTimer, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 import sources, widget_qt, single_instance
+widget_qt.fullscreen.foreground_fullscreen = lambda: False
 app = QApplication([])
 app.setQuitOnLastWindowClosed(False)
 sources.read_all = lambda **kw: [sources.Reading('chatgpt', 'wk', 25)]
@@ -74,7 +75,8 @@ with patch.object(api, 'SetWindowPos', wraps=set_pos) as repair:
     settle()
     repair.assert_not_called()  # Already topmost: never compete with other topmost windows.
     assert not w._topmost_timer.isActive()
-    w.hide()
+    with patch.object(QSystemTrayIcon, 'isSystemTrayAvailable', return_value=True):
+        w._toggle_visibility()
     set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
     settle()
     assert not topmost() and not w.isVisible()
@@ -82,6 +84,17 @@ with patch.object(api, 'SetWindowPos', wraps=set_pos) as repair:
     w._show_window()
     drain(topmost)
     assert api.GetForegroundWindow() == foreground
+    repair.reset_mock()
+    with patch.object(widget_qt.fullscreen, 'foreground_fullscreen', return_value=True):
+        w._sync_visibility()
+        set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
+        settle()
+        w._sync_visibility()
+        assert not w.isVisible() and not topmost(), 'Topmost repair undid fullscreen hiding'
+        repair.assert_not_called()
+    w._sync_visibility()
+    drain(topmost)
+    assert w.isVisible() and api.GetForegroundWindow() == foreground
     repair.reset_mock()
     w.showMinimized()
     set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
@@ -117,11 +130,59 @@ with patch.object(QSystemTrayIcon, 'isSystemTrayAvailable', return_value=True):
     w._toggle_visibility()
 with patch.object(QSystemTrayIcon, 'isSystemTrayAvailable', return_value=False):
     w._update_display()
-    assert w.isVisible(), 'Tray loss stranded the hidden window'
+    w._sync_visibility()
+    assert not w.isVisible(), 'Tray loss undid manual hiding'
+    w._show_window()  # Explicit reopen remains a recovery entry without a tray.
     w._toggle_visibility()
     assert w.isVisible(), 'Hiding without a tray loses the recovery entry'
     w._tray_menu.aboutToShow.emit()
     assert not w._tray_menu.actions()[0].isEnabled()
+''')
+
+    def test_fullscreen_restore_respects_manual_hide_and_keeps_updates_running(self):
+        self.run_qt('''
+with patch.object(widget_qt.fullscreen, 'foreground_fullscreen', return_value=True) as detect, \
+     patch.object(QSystemTrayIcon, 'isSystemTrayAvailable', return_value=True):
+    drain(lambda: not w.isVisible())  # Exercise the actual polling timer.
+    assert w._hidden_by_fullscreen and not w._hidden_by_user
+    w._apply([sources.Reading('chatgpt', 'wk', 45)], schedule=False)
+    assert not w.isVisible() and w.readings[0].percent == 45
+    detect.return_value = None
+    w._sync_visibility()
+    assert not w.isVisible(), 'Transient detection failure flashed the panel'
+    detect.return_value = False
+    drain(w.isVisible)
+    assert not w._hidden_by_fullscreen
+    w._toggle_visibility()  # User hides it before entering another game.
+    detect.return_value = True
+    w._sync_visibility()
+    detect.return_value = False
+    w._sync_visibility()
+    assert not w.isVisible() and w._hidden_by_user
+    w._show_window()
+    assert w.isVisible()
+    detect.return_value = True
+    w._sync_visibility()
+    w._tray_menu.aboutToShow.emit()
+    hide = w._tray_menu.actions()[0]
+    assert hide.text() == '保持隐藏（全屏结束后也不恢复）'
+    hide.trigger()  # User can pin the hidden state while auto-hidden.
+    detect.return_value = False
+    w._sync_visibility()
+    assert not w.isVisible() and w._hidden_by_user
+    detect.return_value = True
+    w._show_window()  # Explicit show/relaunch still yields to fullscreen.
+    assert not w.isVisible() and not w._hidden_by_user
+    detect.return_value = False
+    w._sync_visibility()
+    assert w.isVisible()
+    with patch.object(w, 'show') as show:
+        w._sync_visibility()
+        show.assert_not_called()  # Stable state never repeatedly raises the window.
+w.close()
+assert not w.visibility_timer.isActive()
+w._sync_visibility()
+assert not w.isVisible(), 'Closing window was restored by the poller'
 ''')
 
     def test_lock_drag_details_refresh_and_persistence(self):
