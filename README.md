@@ -204,7 +204,7 @@ CLI 文件残留但令牌已清空也可恢复，无需删除文件或重新登�
 双击项目根目录的 **`build-installer.cmd`**。窗口会保留构建结果，不需要记住
 PowerShell 命令或永久修改执行策略。Python 和依赖仍需与下方便携版构建环境一致。
 
-产物在 `dist\installer\AI-Fuel-0.2.4-windows-x64-setup.exe`，旁边的 `.sha256`
+产物在 `dist\installer\AI-Fuel-0.2.5-windows-x64-setup.exe`，旁边的 `.sha256`
 文件用于校验。发布时只需分发这个安装包，用户无需 Python、编译器或 PowerShell 操作。
 指定版本可运行 `build-installer.cmd -Version 0.2.0`；自定义编译器位置使用
 `-IsccPath "C:\工具目录\ISCC.exe"`。
