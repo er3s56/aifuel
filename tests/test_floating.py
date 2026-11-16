@@ -15,7 +15,7 @@ from window_position import visible_position
 
 @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 not installed")
 class FloatingTests(unittest.TestCase):
-    def run_qt(self, body):
+    def run_qt(self, body, platform="offscreen"):
         with tempfile.TemporaryDirectory(prefix="aifuel-tray-test-") as temp:
             script = '''
 import os, sys, time, threading, subprocess
@@ -41,10 +41,63 @@ w.show()
 ''' + body + '\nw.close()\n'
             result = subprocess.run([sys.executable, '-c', script],
                 cwd=Path(__file__).resolve().parents[1],
-                env=dict(os.environ, LOCALAPPDATA=temp, APPDATA=temp, QT_QPA_PLATFORM='offscreen'),
+                env=dict(os.environ, LOCALAPPDATA=temp, APPDATA=temp, QT_QPA_PLATFORM=platform),
                 capture_output=True, text=True, timeout=10,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Requires real Windows window styles')
+    def test_native_topmost_loss_recovers_without_polling_focus_or_geometry_changes(self):
+        self.run_qt('''
+from ctypes import wintypes as wt
+import window_topmost
+api, get_style = window_topmost._user32()
+api.GetForegroundWindow.restype = wt.HWND
+hwnd = int(w.winId())
+def topmost(): return bool(get_style(hwnd, -20) & 8)
+def settle():
+    for _ in range(10): app.processEvents()
+settle()
+assert topmost(), 'Startup did not create a topmost window'
+geometry = w.geometry()
+foreground = api.GetForegroundWindow()
+set_pos = api.SetWindowPos
+with patch.object(api, 'SetWindowPos', wraps=set_pos) as repair:
+    assert set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
+    assert not topmost() and w.windowFlags() & Qt.WindowStaysOnTopHint
+    drain(topmost)
+    settle()
+    assert repair.call_count == 1, 'Recovery is missing or repeats in a loop'
+    assert w.geometry() == geometry and api.GetForegroundWindow() == foreground
+    repair.reset_mock()
+    for _ in range(20): w._queue_topmost_check()
+    settle()
+    repair.assert_not_called()  # Already topmost: never compete with other topmost windows.
+    assert not w._topmost_timer.isActive()
+    w.hide()
+    set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
+    settle()
+    assert not topmost() and not w.isVisible()
+    repair.assert_not_called()
+    w._show_window()
+    drain(topmost)
+    assert api.GetForegroundWindow() == foreground
+    repair.reset_mock()
+    w.showMinimized()
+    set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
+    settle()
+    assert w.isMinimized() and not topmost()
+    repair.assert_not_called()
+    w.showNormal()
+    drain(topmost)
+    settle()
+    repair.reset_mock()
+    w._closing = True
+    set_pos(hwnd, -2, 0, 0, 0, 0, 0x13)
+    settle()
+    repair.assert_not_called()
+    assert not topmost()
+''', platform="windows")
 
     def test_tray_toggle_hidden_updates_missing_tray_and_menu_state(self):
         self.run_qt('''

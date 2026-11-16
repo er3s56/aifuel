@@ -22,6 +22,7 @@ import sources
 import single_instance
 import legacy_cleanup
 import panel_layout
+import window_topmost
 from window_position import visible_position
 
 CONFIG = os.path.join(sources.data_dir(), "config_qt.json")
@@ -63,6 +64,10 @@ class QuotaWidget(QWidget):
         self.layout_mode = "horizontal" if self.cfg.get("layout") == "horizontal" else "vertical"
         self._display_signature = None
         self._hidden_by_user = False
+        self._closing = False
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.setSingleShot(True)
+        self._topmost_timer.timeout.connect(self._restore_topmost)
         if "taskbar" in self.cfg:
             self.cfg.pop("taskbar")
             self._save_cfg()
@@ -85,7 +90,6 @@ class QuotaWidget(QWidget):
         self.display_timer.timeout.connect(self._update_display)
         self.display_timer.start(1000)
         self._thread = None
-        self._closing = False
         self.reopen_timer = QTimer(self)
         self.reopen_timer.timeout.connect(self._resume_if_requested)
         self.reopen_timer.start(250)
@@ -211,6 +215,29 @@ class QuotaWidget(QWidget):
             self.timer.start(int((min(REFRESH_SEC, wait + .1) if wait else REFRESH_SEC) * 1000))
 
     # ------------------------------------------------ 交互
+
+    def nativeEvent(self, event_type, message):
+        if event_type == b"windows_generic_MSG" and window_topmost.state_changed(message):
+            self._queue_topmost_check()
+        return super().nativeEvent(event_type, message)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._queue_topmost_check()
+
+    def _queue_topmost_check(self):
+        timer = getattr(self, "_topmost_timer", None)
+        if (timer is not None and not self._closing and not timer.isActive()
+                and QApplication.platformName() == "windows"):
+            # Wait until Qt/DefWindowProc finishes the current state transition.
+            # Coalesce native messages; this is not a periodic polling timer.
+            timer.start(0)
+
+    def _restore_topmost(self):
+        if (self._closing or self._hidden_by_user or not self.isVisible() or self.isMinimized()
+                or not self.windowFlags() & Qt.WindowStaysOnTopHint):
+            return
+        window_topmost.restore_if_lost(int(self.winId()))
 
     def _resize_floating(self, recover=True):
         if self._resize_start is not None:
